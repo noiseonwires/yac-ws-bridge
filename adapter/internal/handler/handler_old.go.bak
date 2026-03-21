@@ -1,0 +1,271 @@
+package handler
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/bridge-to-freedom/adapter/internal/config"
+	"github.com/bridge-to-freedom/adapter/internal/protocol"
+	"github.com/gorilla/websocket"
+)
+
+// setTCPNoDelay disables Nagle's algorithm on a websocket connection.
+func setTCPNoDelay(conn *websocket.Conn) {
+	if tc, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+}
+
+// ClientStatus tracks the state of a target connection.
+type ClientStatus int
+
+const (
+	StatusConnecting ClientStatus = iota
+	StatusOpen
+)
+
+// pendingMsg is a message buffered while the target connection is being established.
+type pendingMsg struct {
+	MsgType int
+	Data    []byte
+}
+
+// ClientState is the per-client state the adapter tracks.
+type ClientState struct {
+	Status   ClientStatus
+	TargetWS *websocket.Conn
+	Cancel   context.CancelFunc
+	Pending  []pendingMsg // buffered during StatusConnecting
+	wmu      sync.Mutex   // serializes writes to TargetWS
+}
+
+// SendFunc is a function that sends a frame upstream.
+type SendFunc func(protocol.Frame)
+
+// Handler dispatches incoming protocol frames and manages client state.
+type Handler struct {
+	mu      sync.Mutex
+	clients map[string]*ClientState
+	sendFn  SendFunc
+	cfg     *config.Config
+}
+
+// New creates a new Handler.
+func New(cfg *config.Config) *Handler {
+	return &Handler{
+		clients: make(map[string]*ClientState),
+		cfg:     cfg,
+	}
+}
+
+// SetSendFn sets the upstream send function. Must be called before handling frames.
+func (h *Handler) SetSendFn(fn SendFunc) {
+	h.sendFn = fn
+}
+
+func (h *Handler) send(f protocol.Frame) {
+	if h.sendFn != nil {
+		h.sendFn(f)
+	}
+}
+
+// HandleFrame routes a decoded frame to the correct handler.
+func (h *Handler) HandleFrame(f protocol.Frame) {
+	switch f.Type {
+	case protocol.MsgClientConnected:
+		h.onClientConnected(f)
+	case protocol.MsgDataC2T:
+		h.onDataC2T(f)
+	case protocol.MsgClientDisconnected:
+		h.onClientDisconnected(f)
+	case protocol.MsgPing:
+		h.send(protocol.Frame{Type: protocol.MsgPong})
+	case protocol.MsgPong:
+		// Expected response to our PING — nothing to do
+	default:
+		slog.Warn("unknown message type", "type", f.Type)
+	}
+}
+
+func (h *Handler) onClientConnected(f protocol.Frame) {
+	payload, err := protocol.DecodeClientConnected(f.Payload)
+	if err != nil {
+		slog.Error("bad CLIENT_CONNECTED payload", "err", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cs := &ClientState{Status: StatusConnecting, Cancel: cancel}
+
+	h.mu.Lock()
+	h.clients[f.ClientID] = cs
+	h.mu.Unlock()
+
+	go h.connectToTarget(ctx, f.ClientID, payload)
+}
+
+func (h *Handler) connectToTarget(ctx context.Context, clientID string, p protocol.ClientConnectedPayload) {
+	targetURL := h.cfg.Target.URL + p.Path
+	start := time.Now()
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		EnableCompression: false,
+	}
+	header := http.Header{}
+	if p.Subprotocols != "" {
+		dialer.Subprotocols = []string{p.Subprotocols}
+	}
+
+	slog.Debug("dialing target", "clientID", clientID, "url", targetURL, "subprotocols", p.Subprotocols)
+	conn, resp, err := dialer.DialContext(ctx, targetURL, header)
+	dialDur := time.Since(start)
+	if err != nil {
+		extra := ""
+		if resp != nil {
+			extra = resp.Status
+		}
+		slog.Error("target connect failed", "clientID", clientID, "err", err, "took", dialDur, "respStatus", extra)
+		h.send(protocol.Frame{
+			ClientID: clientID,
+			Type:     protocol.MsgTargetConnFailed,
+			Payload:  []byte(err.Error()),
+		})
+		h.mu.Lock()
+		delete(h.clients, clientID)
+		h.mu.Unlock()
+		return
+	}
+	setTCPNoDelay(conn)
+	slog.Info("target connected", "clientID", clientID, "url", targetURL, "took", dialDur)
+
+	h.mu.Lock()
+	cs, ok := h.clients[clientID]
+	if !ok {
+		h.mu.Unlock()
+		conn.Close()
+		return
+	}
+	cs.TargetWS = conn
+	cs.Status = StatusOpen
+	pending := cs.Pending
+	cs.Pending = nil
+	h.mu.Unlock()
+
+	// Flush buffered messages under write lock
+	cs.wmu.Lock()
+	for _, m := range pending {
+		if err := conn.WriteMessage(m.MsgType, m.Data); err != nil {
+			slog.Error("flush pending to target failed", "clientID", clientID, "err", err)
+			break
+		}
+	}
+	cs.wmu.Unlock()
+
+	h.send(protocol.Frame{ClientID: clientID, Type: protocol.MsgTargetConnected})
+	slog.Info("target ready", "clientID", clientID, "pendingFlushed", len(pending))
+
+	h.readFromTarget(clientID, conn)
+}
+
+func (h *Handler) onDataC2T(f protocol.Frame) {
+	msgType := websocket.BinaryMessage
+	if f.Flags&protocol.FlagTextFrame != 0 {
+		msgType = websocket.TextMessage
+	}
+
+	h.mu.Lock()
+	cs, ok := h.clients[f.ClientID]
+	if !ok {
+		h.mu.Unlock()
+		slog.Debug("DATA_C2T for unknown client, dropping", "clientID", f.ClientID)
+		return
+	}
+	if cs.Status == StatusConnecting {
+		// Buffer while target connection is being established
+		cs.Pending = append(cs.Pending, pendingMsg{MsgType: msgType, Data: f.Payload})
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	cs.wmu.Lock()
+	err := cs.TargetWS.WriteMessage(msgType, f.Payload)
+	cs.wmu.Unlock()
+	if err != nil {
+		slog.Error("write to target failed", "clientID", f.ClientID, "err", err)
+	}
+}
+
+func (h *Handler) onClientDisconnected(f protocol.Frame) {
+	h.mu.Lock()
+	cs, ok := h.clients[f.ClientID]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.clients, f.ClientID)
+	h.mu.Unlock()
+
+	cs.Cancel()
+	if cs.TargetWS != nil {
+		cs.TargetWS.Close()
+	}
+	slog.Info("client disconnected, closed target", "clientID", f.ClientID)
+}
+
+func (h *Handler) readFromTarget(clientID string, conn *websocket.Conn) {
+	defer func() {
+		conn.Close()
+
+		h.mu.Lock()
+		_, ok := h.clients[clientID]
+		if ok {
+			delete(h.clients, clientID)
+		}
+		h.mu.Unlock()
+
+		if ok {
+			h.send(protocol.Frame{ClientID: clientID, Type: protocol.MsgTargetDisconnected})
+			slog.Info("target disconnected", "clientID", clientID)
+		}
+	}()
+
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		var flags byte
+		if msgType == websocket.TextMessage {
+			flags = protocol.FlagTextFrame
+		}
+
+		h.send(protocol.Frame{
+			ClientID: clientID,
+			Type:     protocol.MsgDataT2C,
+			Flags:    flags,
+			Payload:  data,
+		})
+	}
+}
+
+// CloseAll closes all target connections. Called when upstream drops.
+func (h *Handler) CloseAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for id, cs := range h.clients {
+		cs.Cancel()
+		if cs.TargetWS != nil {
+			cs.TargetWS.Close()
+		}
+		delete(h.clients, id)
+	}
+	slog.Warn("upstream lost, closed all target connections")
+}

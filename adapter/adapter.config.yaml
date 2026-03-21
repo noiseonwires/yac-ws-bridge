@@ -1,0 +1,18 @@
+bridge:
+  url: "ws://localhost:8080/_upstream"
+  authToken: "changeme"
+  reconnect:
+    initialDelayMs: 1000
+    maxDelayMs: 30000
+    backoffMultiplier: 2
+  pingIntervalMs: 15000
+
+wakeup:
+  listenPort: 3001
+  # pathPrefix: "/somepath/aaa"  # optional, must match ADAPTER_URL path in cloud function
+
+target:
+  url: "ws://localhost:9090"
+
+logging:
+  level: "info"

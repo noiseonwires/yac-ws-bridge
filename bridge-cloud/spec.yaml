@@ -1,0 +1,99 @@
+﻿openapi: 3.0.0
+info:
+  title: Bridge to Freedom
+  version: 3.0.0
+
+paths:
+  /_upstream:
+    x-yc-apigateway-websocket-connect:
+      operationId: upstream-connect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: upstream
+    x-yc-apigateway-websocket-message:
+      operationId: upstream-message
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: upstream
+    x-yc-apigateway-websocket-disconnect:
+      operationId: upstream-disconnect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: upstream
+
+  # Catch-all: any path except /_upstream is treated as a client connection.
+  # The exact path is forwarded to the target as-is.
+  /{path+}:
+    x-yc-apigateway-websocket-connect:
+      operationId: client-connect
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: client
+    x-yc-apigateway-websocket-message:
+      operationId: client-message
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: client
+    x-yc-apigateway-websocket-disconnect:
+      operationId: client-disconnect
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: client
+    # HTTP forwarding (enabled via FORWARD_HTTP env on the cloud function)
+    x-yc-apigateway-any-method:
+      operationId: http-proxy
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: http
