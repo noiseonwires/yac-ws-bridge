@@ -1,0 +1,63 @@
+﻿openapi: 3.0.0
+info:
+  title: Bridge to Freedom v4
+  version: 4.0.0
+
+paths:
+  /_adapter:
+    x-yc-apigateway-websocket-connect:
+      operationId: adapter-connect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: adapter
+    x-yc-apigateway-websocket-message:
+      operationId: adapter-message
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: adapter
+    x-yc-apigateway-websocket-disconnect:
+      operationId: adapter-disconnect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: adapter
+
+  /_helper:
+    x-yc-apigateway-websocket-connect:
+      operationId: helper-connect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: helper
+    x-yc-apigateway-websocket-message:
+      operationId: helper-message
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: helper
+    x-yc-apigateway-websocket-disconnect:
+      operationId: helper-disconnect
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: ${FUNCTION_ID}
+        tag: "$latest"
+        service_account_id: ${SERVICE_ACCOUNT_ID}
+        context:
+          route: helper

@@ -1,0 +1,24 @@
+# Bridge (Node.js)
+bridge/node_modules/
+bridge/dist/
+
+# Adapter (Go)
+adapter/adapter
+adapter/adapter.exe
+adapter/helper
+adapter/helper.exe
+
+# Config with secrets
+adapter.config.yaml
+!adapter/adapter.config.yaml
+helper.config.yaml
+!adapter/helper.config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+.vs
+.vscode
+client/bin
+client/obj
