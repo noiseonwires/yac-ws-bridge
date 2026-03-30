@@ -31,6 +31,10 @@ type Config struct {
 		Mode  string `yaml:"mode"`
 		Relay bool   `yaml:"relay"`
 	} `yaml:"wsApi"`
+	WriteCoalescing struct {
+		Enabled bool `yaml:"enabled"`
+		DelayMs int  `yaml:"delayMs"`
+	} `yaml:"writeCoalescing"`
 	Logging struct {
 		Level string `yaml:"level"`
 	} `yaml:"logging"`
@@ -46,6 +50,13 @@ func (c *Config) MaxDelay() time.Duration {
 
 func (c *Config) PingInterval() time.Duration {
 	return time.Duration(c.Bridge.PingIntervalMs) * time.Millisecond
+}
+
+func (c *Config) CoalesceDelay() time.Duration {
+	if !c.WriteCoalescing.Enabled || c.WriteCoalescing.DelayMs <= 0 {
+		return 0
+	}
+	return time.Duration(c.WriteCoalescing.DelayMs) * time.Millisecond
 }
 
 func Load(path string) (*Config, error) {

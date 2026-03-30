@@ -28,31 +28,34 @@ const (
 )
 
 // Frame is a single protocol message.
-// Wire: [1B type][4B streamID BE][payload...]
+// Wire: [1B type][4B streamID BE][4B seqID BE][payload...]
 type Frame struct {
 	Type     byte
 	StreamID uint32
+	SeqID    uint32
 	Payload  []byte
 }
 
 // Encode serialises a Frame.
 func Encode(f Frame) []byte {
-	buf := make([]byte, 5+len(f.Payload))
+	buf := make([]byte, 9+len(f.Payload))
 	buf[0] = f.Type
 	binary.BigEndian.PutUint32(buf[1:5], f.StreamID)
-	copy(buf[5:], f.Payload)
+	binary.BigEndian.PutUint32(buf[5:9], f.SeqID)
+	copy(buf[9:], f.Payload)
 	return buf
 }
 
 // Decode parses a byte slice into a Frame.
 func Decode(data []byte) (Frame, error) {
-	if len(data) < 5 {
+	if len(data) < 9 {
 		return Frame{}, errors.New("frame too short")
 	}
 	return Frame{
 		Type:     data[0],
 		StreamID: binary.BigEndian.Uint32(data[1:5]),
-		Payload:  data[5:],
+		SeqID:    binary.BigEndian.Uint32(data[5:9]),
+		Payload:  data[9:],
 	}, nil
 }
 

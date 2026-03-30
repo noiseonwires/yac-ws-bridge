@@ -5,7 +5,7 @@ namespace BridgeToFreedom.Services;
 
 /// <summary>
 /// Binary protocol matching the Go adapter/helper protocol exactly.
-/// Wire format: [1B type][4B streamID BE][payload...]
+/// Wire format: [1B type][4B streamID BE][4B seqID BE][payload...]
 /// </summary>
 public static class Protocol
 {
@@ -47,22 +47,27 @@ public static class Protocol
     };
 
     public static byte[] Encode(byte type, uint streamId, byte[]? payload = null)
+        => Encode(type, streamId, 0u, payload);
+
+    public static byte[] Encode(byte type, uint streamId, uint seqId, byte[]? payload = null)
     {
         var p = payload ?? [];
-        var buf = new byte[5 + p.Length];
+        var buf = new byte[9 + p.Length];
         buf[0] = type;
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(1), streamId);
-        if (p.Length > 0) p.CopyTo(buf, 5);
+        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(5), seqId);
+        if (p.Length > 0) p.CopyTo(buf, 9);
         return buf;
     }
 
-    public static (byte Type, uint StreamId, byte[] Payload) Decode(byte[] data)
+    public static (byte Type, uint StreamId, uint SeqId, byte[] Payload) Decode(byte[] data)
     {
-        if (data.Length < 5) throw new InvalidDataException("frame too short");
+        if (data.Length < 9) throw new InvalidDataException("frame too short");
         var type = data[0];
         var streamId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(1));
-        var payload = data.Length > 5 ? data[5..] : [];
-        return (type, streamId, payload);
+        var seqId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(5));
+        var payload = data.Length > 9 ? data[9..] : [];
+        return (type, streamId, seqId, payload);
     }
 
     public static byte[] EncodeHello(byte version, string token)

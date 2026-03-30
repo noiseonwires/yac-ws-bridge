@@ -25,6 +25,7 @@ public partial class MainPage : ContentPage
         ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "0.0.0.0");
         ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "5080");
         RelaySwitch.IsToggled = Preferences.Default.Get("Relay", false);
+        CoalesceSwitch.IsToggled = Preferences.Default.Get("WriteCoalescing", false);
 
         // Restore UI state if tunnel is already running (e.g. after activity recreate from background)
         if (_tunnel.IsRunning)
@@ -55,6 +56,7 @@ public partial class MainPage : ContentPage
             qs["token"] = AuthTokenEntry.Text?.Trim() ?? "";
             qs["listen"] = $"{ListenAddressEntry.Text?.Trim()}:{ListenPortEntry.Text?.Trim()}";
             if (RelaySwitch.IsToggled) qs["relay"] = "1";
+            if (CoalesceSwitch.IsToggled) qs["coalesce"] = "1";
 
             var btfUrl = $"btf://{bridgeUri.Host}{bridgeUri.AbsolutePath}?{qs}";
             await Clipboard.Default.SetTextAsync(btfUrl);
@@ -93,6 +95,7 @@ public partial class MainPage : ContentPage
             }
 
             RelaySwitch.IsToggled = qs["relay"] == "1";
+            CoalesceSwitch.IsToggled = qs["coalesce"] == "1";
             AddLog("Config imported from clipboard");
         }
         catch (Exception ex)
@@ -143,6 +146,7 @@ public partial class MainPage : ContentPage
         _tunnel.ListenAddress = addr ?? "0.0.0.0";
         _tunnel.ListenPort = port;
         _tunnel.Relay = RelaySwitch.IsToggled;
+        _tunnel.WriteCoalescing = CoalesceSwitch.IsToggled;
 
         // Save settings
         Preferences.Default.Set("BridgeUrl", url);
@@ -150,6 +154,7 @@ public partial class MainPage : ContentPage
         Preferences.Default.Set("ListenAddress", addr ?? "0.0.0.0");
         Preferences.Default.Set("ListenPort", portStr!);
         Preferences.Default.Set("Relay", RelaySwitch.IsToggled);
+        Preferences.Default.Set("WriteCoalescing", CoalesceSwitch.IsToggled);
 
         _isRunning = true;
         ConnectButton.Text = "DISCONNECT";

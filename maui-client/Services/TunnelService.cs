@@ -30,6 +30,7 @@ public sealed class TunnelService : IDisposable
 
     private readonly ConcurrentDictionary<uint, StreamState> _streams = new();
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pendingOpens = new();
+    private readonly ConcurrentDictionary<uint, uint> _streamSeqs = new();
 
     // Config
     public string BridgeUrl { get; set; } = "";
@@ -38,6 +39,8 @@ public sealed class TunnelService : IDisposable
     public int ListenPort { get; set; } = 5080;
     public bool Relay { get; set; }
     public int PingIntervalMs { get; set; } = 30000;
+    public bool WriteCoalescing { get; set; }
+    public int WriteCoalescingDelayMs { get; set; } = 10;
 
     public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
 
@@ -143,7 +146,7 @@ public sealed class TunnelService : IDisposable
                 var resp = await WsReceiveWithTimeout(TimeSpan.FromSeconds(10), ct);
                 if (resp == null) { Log("No HELLO response, retrying..."); continue; }
 
-                var (type, _, payload) = Protocol.Decode(resp);
+                var (type, _, _, payload) = Protocol.Decode(resp);
                 if (type == Protocol.MsgHelloErr)
                 {
                     Log($"Auth rejected: {System.Text.Encoding.UTF8.GetString(payload)}");
@@ -253,7 +256,7 @@ public sealed class TunnelService : IDisposable
     {
         try
         {
-            var (type, streamId, payload) = Protocol.Decode(data);
+            var (type, streamId, _, payload) = Protocol.Decode(data);
 
             switch (type)
             {
@@ -265,6 +268,8 @@ public sealed class TunnelService : IDisposable
                         return;
                     }
                     _staleConnId = "";
+                    // Cancel pending opens from previous peer session
+                    CancelPendingOpens("new peer connected");
                     _peerConnId = peerId;
                     if (iamToken != "") _iamToken = iamToken;
                     Log($"Peer connected: {Shorten(peerId)}");
@@ -273,6 +278,7 @@ public sealed class TunnelService : IDisposable
                 case Protocol.MsgPeerGone:
                     Log($"Peer gone, closing {_streams.Count} streams");
                     _peerConnId = "";
+                    CancelPendingOpens("peer gone");
                     CloseAllStreams();
                     break;
 
@@ -392,7 +398,7 @@ public sealed class TunnelService : IDisposable
             }
 
             // Send OPEN
-            var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid));
+            var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid, NextSeq(sid)));
             if (err != null) { Log($"OPEN failed stream={sid}: {err}"); client.Dispose(); return; }
 
             // Wait for OPEN_OK/OPEN_FAIL
@@ -403,7 +409,7 @@ public sealed class TunnelService : IDisposable
             catch (OperationCanceledException) { Log($"OPEN timeout stream={sid}"); client.Dispose(); return; }
             finally { _pendingOpens.TryRemove(sid, out _); }
 
-            var (type, _, payload) = Protocol.Decode(resp);
+            var (type, _, _, payload) = Protocol.Decode(resp);
             if (type == Protocol.MsgOpenFail)
             {
                 Log($"OPEN rejected stream={sid}");
@@ -423,7 +429,7 @@ public sealed class TunnelService : IDisposable
             if (!state.Closed)
             {
                 // Send FIN
-                _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgFin, sid));
+                _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgFin, sid, NextSeq(sid)));
             }
             CloseStream(state);
         }
@@ -432,23 +438,95 @@ public sealed class TunnelService : IDisposable
     private async Task TcpReadLoopAsync(StreamState state, CancellationToken ct)
     {
         var buf = new byte[32 * 1024];
+        byte[]? coalesceBuf = null;
+        var coalesce = WriteCoalescing && WriteCoalescingDelayMs > 0;
+
+        async Task FlushCoalesce()
+        {
+            if (coalesceBuf == null || coalesceBuf.Length == 0) return;
+            var data = coalesceBuf;
+            coalesceBuf = null;
+            var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, NextSeq(state.Id), data));
+            if (err != null) Log($"Send DATA failed stream={state.Id}: {err}");
+        }
+
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cts.Token);
             while (!linked.IsCancellationRequested)
             {
-                int n = await state.NetStream.ReadAsync(buf.AsMemory(0, buf.Length), linked.Token);
-                if (n == 0) return; // EOF
+                int n;
+                if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
+                {
+                    // We have buffered data. Check if more is already waiting.
+                    if (state.NetStream.DataAvailable)
+                    {
+                        // Data in kernel buffer — read immediately without blocking
+                        n = state.NetStream.Read(buf, 0, buf.Length);
+                    }
+                    else
+                    {
+                        // Nothing waiting — give it coalescingMs for more data to arrive
+                        await Task.Delay(WriteCoalescingDelayMs, linked.Token);
+                        if (state.NetStream.DataAvailable)
+                        {
+                            n = state.NetStream.Read(buf, 0, buf.Length);
+                        }
+                        else
+                        {
+                            // Still nothing — flush what we have and block for next read
+                            await FlushCoalesce();
+                            continue;
+                        }
+                    }
+                }
+                else
+                {
+                    // No buffered data (or coalescing off) — block until data arrives
+                    n = await state.NetStream.ReadAsync(buf, 0, buf.Length, linked.Token);
+                }
 
-                var payload = new byte[n];
-                Buffer.BlockCopy(buf, 0, payload, 0, n);
-                var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, payload));
-                if (err != null) { Log($"Send DATA failed stream={state.Id}: {err}"); return; }
+                if (n == 0) break; // EOF
+
+                if (coalesce)
+                {
+                    // Append to coalesce buffer
+                    if (coalesceBuf == null)
+                    {
+                        coalesceBuf = new byte[n];
+                        Buffer.BlockCopy(buf, 0, coalesceBuf, 0, n);
+                    }
+                    else
+                    {
+                        var newBuf = new byte[coalesceBuf.Length + n];
+                        Buffer.BlockCopy(coalesceBuf, 0, newBuf, 0, coalesceBuf.Length);
+                        Buffer.BlockCopy(buf, 0, newBuf, coalesceBuf.Length, n);
+                        coalesceBuf = newBuf;
+                    }
+                    // Flush immediately if buffer is large enough
+                    if (coalesceBuf.Length >= 32 * 1024)
+                        await FlushCoalesce();
+                }
+                else
+                {
+                    var payload = new byte[n];
+                    Buffer.BlockCopy(buf, 0, payload, 0, n);
+                    var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, NextSeq(state.Id), payload));
+                    if (err != null) { Log($"Send DATA failed stream={state.Id}: {err}"); return; }
+                }
             }
         }
         catch (OperationCanceledException) { }
         catch (IOException) { } // connection closed
         catch (Exception ex) { Log($"TCP read stream={state.Id}: {ex.Message}"); }
+        finally
+        {
+            // Flush any remaining buffered data
+            if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
+            {
+                try { await FlushCoalesce(); } catch { }
+            }
+        }
     }
 
     // --- Readiness ---
@@ -461,6 +539,18 @@ public sealed class TunnelService : IDisposable
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
+
+        // Send SYNC to speed up peer discovery when upstream is connected but peer is unknown
+        if (_upstreamReady && !Relay && string.IsNullOrEmpty(_peerConnId))
+        {
+            try
+            {
+                Log("Peer unknown, sending SYNC for discovery");
+                await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), ct);
+            }
+            catch { }
+        }
+
         try
         {
             while (!timeout.IsCancellationRequested)
@@ -610,7 +700,20 @@ public sealed class TunnelService : IDisposable
     private void CloseStream(StreamState state)
     {
         if (_streams.TryRemove(state.Id, out _))
+        {
+            _streamSeqs.TryRemove(state.Id, out _);
             state.Dispose();
+        }
+    }
+
+    private void CancelPendingOpens(string reason)
+    {
+        var count = _pendingOpens.Count;
+        foreach (var kvp in _pendingOpens)
+            kvp.Value.TrySetCanceled();
+        _pendingOpens.Clear();
+        if (count > 0)
+            Log($"Cancelled {count} pending opens: {reason}");
     }
 
     private void CloseAllStreams()
@@ -620,9 +723,8 @@ public sealed class TunnelService : IDisposable
             kvp.Value.Dispose();
         }
         _streams.Clear();
-        foreach (var kvp in _pendingOpens)
-            kvp.Value.TrySetCanceled();
-        _pendingOpens.Clear();
+        _streamSeqs.Clear();
+        CancelPendingOpens("close all");
     }
 
     private void CloseUpstream()
@@ -656,6 +758,9 @@ public sealed class TunnelService : IDisposable
 
     private static string Shorten(string id) =>
         id.Length > 12 ? id[..8] + "..." + id[^4..] : id;
+
+    private uint NextSeq(uint streamId) =>
+        _streamSeqs.AddOrUpdate(streamId, 1, (_, old) => old + 1);
 
     public void Dispose()
     {

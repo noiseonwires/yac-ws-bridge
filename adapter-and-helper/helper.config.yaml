@@ -1,0 +1,27 @@
+# Helper — accepts local TCP connections and tunnels them through the bridge.
+
+bridge:
+  url: "wss://YOUR_APIGW_ID.apigw.yandexcloud.net/_helper"
+  authToken: "YOUR_AUTH_TOKEN"
+  reconnect:
+    initialDelayMs: 1000
+    maxDelayMs: 30000
+    backoffMultiplier: 2.0
+  pingIntervalMs: 30000
+
+# Local address helper listens on for incoming TCP connections.
+listen:
+  address: "127.0.0.1:1080"
+
+# Nagle-like write coalescing: buffer small TCP reads into larger DATA frames.
+# Reduces wsSend calls and improves throughput. Flush on delayMs timeout or 32KB.
+writeCoalescing:
+  enabled: true
+  delayMs: 50
+
+wsApi:
+  mode: "grpc"
+  relay: false
+
+logging:
+  level: "info"

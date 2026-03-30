@@ -53,6 +53,8 @@ func main() {
 		}
 		return err
 	})
+	sm.CoalesceDelay = cfg.CoalesceDelay()
+	sm.Reorder = true
 
 	ups = upstream.New(cfg, func(f protocol.Frame) {
 		switch f.Type {
@@ -87,17 +89,24 @@ func main() {
 			ups.SetIAMToken(iamToken)
 
 		// --- Stream ---
-		case protocol.MsgOpen:
-			log.Printf("[INFO] OPEN received stream=%d", f.StreamID)
-			go handleOpen(cfg, sm, f.StreamID)
-		case protocol.MsgData:
-			sm.HandleData(f.StreamID, f.Payload)
-		case protocol.MsgFin:
-			log.Printf("[INFO] FIN received stream=%d", f.StreamID)
-			sm.HandleFin(f.StreamID)
-		case protocol.MsgRst:
-			log.Printf("[INFO] RST received stream=%d", f.StreamID)
-			sm.HandleRst(f.StreamID)
+		case protocol.MsgOpen, protocol.MsgData, protocol.MsgFin, protocol.MsgRst:
+			if f.Type != protocol.MsgData {
+				log.Printf("[INFO] %s received stream=%d seq=%d",
+					map[byte]string{protocol.MsgOpen: "OPEN", protocol.MsgFin: "FIN", protocol.MsgRst: "RST"}[f.Type],
+					f.StreamID, f.SeqID)
+			}
+			sm.HandleStreamFrame(f, func(of protocol.Frame) {
+				switch of.Type {
+				case protocol.MsgOpen:
+					go handleOpen(cfg, sm, of.StreamID)
+				case protocol.MsgData:
+					sm.HandleData(of.StreamID, of.Payload)
+				case protocol.MsgFin:
+					sm.HandleFin(of.StreamID)
+				case protocol.MsgRst:
+					sm.HandleRst(of.StreamID)
+				}
+			})
 		default:
 			log.Printf("[WARN] unknown frame type=0x%02x stream=%d", f.Type, f.StreamID)
 		}
@@ -159,7 +168,7 @@ func main() {
 		go func() { <-ctx.Done(); srv.Close() }()
 	}
 
-	log.Printf("[INFO] adapter starting bridge=%s target=%s", cfg.Bridge.URL, cfg.Target.Address)
+	log.Printf("[INFO] adapter starting bridge=%s target=%s coalesce=%v", cfg.Bridge.URL, cfg.Target.Address, cfg.CoalesceDelay())
 	ups.Run(ctx)
 }
 

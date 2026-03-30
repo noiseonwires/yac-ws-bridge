@@ -76,6 +76,14 @@
                             IsEnabled="{Binding IsNotRunning}" />
                 </Grid>
 
+                <!-- Write coalescing toggle -->
+                <Grid ColumnDefinitions="*,Auto">
+                    <Label Text="Write coalescing (Nagle-like, 50ms)"
+                           VerticalOptions="Center" FontSize="13" />
+                    <Switch x:Name="CoalesceSwitch" Grid.Column="1"
+                            IsEnabled="{Binding IsNotRunning}" />
+                </Grid>
+
                 <!-- Connect / Disconnect Button -->
                 <Button x:Name="ConnectButton"
                         Text="CONNECT"

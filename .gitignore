@@ -3,16 +3,16 @@ bridge/node_modules/
 bridge/dist/
 
 # Adapter (Go)
-adapter/adapter
-adapter/adapter.exe
-adapter/helper
-adapter/helper.exe
+adapter-and-helper/adapter
+adapter-and-helper/adapter.exe
+adapter-and-helper/helper
+adapter-and-helper/helper.exe
 
 # Config with secrets
 adapter.config.yaml
-!adapter/adapter.config.yaml
+!adapter-and-helper/adapter.config.yaml
 helper.config.yaml
-!adapter/helper.config.yaml
+!adapter-and-helper/helper.config.yaml
 
 # OS
 .DS_Store
@@ -20,5 +20,5 @@ Thumbs.db
 
 .vs
 .vscode
-client/bin
-client/obj
+maui-client/bin
+maui-client/obj

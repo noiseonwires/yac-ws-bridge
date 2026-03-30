@@ -1,0 +1,30 @@
+# Adapter — accepts streams from the bridge and forwards them to a local target.
+
+bridge:
+  url: "wss://YOUR_APIGW_ID.apigw.yandexcloud.net/_adapter"
+  authToken: "YOUR_AUTH_TOKEN"
+  reconnect:
+    initialDelayMs: 1000
+    maxDelayMs: 30000
+    backoffMultiplier: 2.0
+  pingIntervalMs: 30000
+
+# Local service the adapter connects to for each incoming stream.
+target:
+  address: "127.0.0.1:1080"
+
+# Optional HTTP endpoint for health / status checks (0 = disabled).
+http:
+  listenPort: 0
+
+# Nagle-like write coalescing: buffer small TCP reads into larger DATA frames.
+# Reduces wsSend calls and improves throughput. Flush on delayMs timeout or 32KB.
+writeCoalescing:
+  enabled: true
+  delayMs: 50
+
+wsApi:
+  mode: "grpc"
+
+logging:
+  level: "info"

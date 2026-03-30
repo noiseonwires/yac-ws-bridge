@@ -3,9 +3,9 @@
   <PropertyGroup>
     <IsFirstTimeProjectOpen>False</IsFirstTimeProjectOpen>
     <ActiveDebugFramework>net10.0-android</ActiveDebugFramework>
-    <ActiveDebugProfile>iPhone 17 iOS 26.1</ActiveDebugProfile>
-    <SelectedPlatformGroup>Simulator</SelectedPlatformGroup>
-    <DefaultDevice>iPhone 17 iOS 26.1</DefaultDevice>
+    <ActiveDebugProfile>Motorola moto g(8) (Android 11.0 - API 30)</ActiveDebugProfile>
+    <SelectedPlatformGroup>PhysicalDevice</SelectedPlatformGroup>
+    <DefaultDevice>Medium_Phone_API_36.0</DefaultDevice>
     <DeveloperId>CLT9BNS3CCSP</DeveloperId>
     <DevelopmentTeamId>CLT9BNS3CCSP</DevelopmentTeamId>
   </PropertyGroup>
