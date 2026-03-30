@@ -17,6 +17,7 @@ target:
 http:
   listenPort: 0
 
+
 # Nagle-like write coalescing: buffer small TCP reads into larger DATA frames.
 # Reduces wsSend calls and improves throughput. Flush on delayMs timeout or 32KB.
 writeCoalescing:
