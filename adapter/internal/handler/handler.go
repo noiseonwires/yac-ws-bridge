@@ -5,6 +5,7 @@ import (
 "log"
 "net"
 "net/http"
+"sort"
 "sync"
 "time"
 
@@ -23,22 +24,59 @@ pending  []pendingMsg
 }
 
 type pendingMsg struct {
+seqID   string
 msgType int
 data    []byte
 }
 
+// earlyBuffer holds frames that arrived before CLIENT_CONNECTED
+// (serverless CF instances may deliver DATA/DISCONNECT before CONNECT).
+type earlyBuffer struct {
+frames       []pendingMsg
+disconnected bool
+createdAt    time.Time
+}
+
 type Handler struct {
-mu      sync.Mutex
-clients map[string]*clientState
-cfg     *config.Config
-ws      wsapi.Client
+mu        sync.Mutex
+clients   map[string]*clientState
+earlyData map[string]*earlyBuffer
+closedIDs map[string]time.Time // recently closed clients — drop their late-arriving data
+cfg       *config.Config
+ws        wsapi.Client
 }
 
 func New(cfg *config.Config) *Handler {
-return &Handler{
-clients: make(map[string]*clientState),
-cfg: cfg,
-ws: wsapi.NewClient(cfg.WsApi.Mode),
+h := &Handler{
+clients:   make(map[string]*clientState),
+earlyData: make(map[string]*earlyBuffer),
+closedIDs: make(map[string]time.Time),
+cfg:       cfg,
+ws:        wsapi.NewClient(cfg.WsApi.Mode),
+}
+go h.cleanupEarlyData()
+return h
+}
+
+// cleanupEarlyData periodically evicts stale early buffers
+// that were never claimed by a CLIENT_CONNECTED.
+func (h *Handler) cleanupEarlyData() {
+ticker := time.NewTicker(10 * time.Second)
+defer ticker.Stop()
+for range ticker.C {
+h.mu.Lock()
+for id, eb := range h.earlyData {
+if time.Since(eb.createdAt) > 30*time.Second {
+	log.Printf("[WARN] dropping stale early buffer clientID=%s msgs=%d age=%v", id, len(eb.frames), time.Since(eb.createdAt))
+delete(h.earlyData, id)
+}
+}
+for id, t := range h.closedIDs {
+if time.Since(t) > 30*time.Second {
+delete(h.closedIDs, id)
+}
+}
+h.mu.Unlock()
 }
 }
 
@@ -71,6 +109,22 @@ ctx, cancel := context.WithCancel(context.Background())
 cs := &clientState{cancel: cancel, iamToken: payload.IAMToken}
 
 h.mu.Lock()
+// Check for messages/disconnect that arrived before this CLIENT_CONNECTED
+if eb, ok := h.earlyData[f.ClientID]; ok {
+delete(h.earlyData, f.ClientID)
+if eb.disconnected {
+h.mu.Unlock()
+cancel()
+	log.Printf("[INFO] client already disconnected before registration clientID=%s earlyMsgs=%d", f.ClientID, len(eb.frames))
+return
+}
+if len(eb.frames) > 0 {
+// Sort early messages by seqID (messageId is incrementally assigned)
+sort.Slice(eb.frames, func(i, j int) bool { return eb.frames[i].seqID < eb.frames[j].seqID })
+cs.pending = append(cs.pending, eb.frames...)
+	log.Printf("[INFO] incorporated %d early messages (sorted by seqID) for clientID=%s", len(eb.frames), f.ClientID)
+}
+}
 h.clients[f.ClientID] = cs
 h.mu.Unlock()
 
@@ -100,6 +154,7 @@ h.ws.Disconnect(clientID, cs.iamToken)
 }
 h.mu.Lock()
 delete(h.clients, clientID)
+h.closedIDs[clientID] = time.Now()
 h.mu.Unlock()
 return
 }
@@ -134,15 +189,30 @@ if f.Flags&protocol.FlagTextFrame != 0 {
 msgType = websocket.TextMessage
 }
 
+msg := pendingMsg{seqID: f.SeqID, msgType: msgType, data: f.Payload}
+
 h.mu.Lock()
 cs, ok := h.clients[f.ClientID]
 if !ok {
+// Check if this client was already closed — drop late-arriving data
+if _, closed := h.closedIDs[f.ClientID]; closed {
 h.mu.Unlock()
 return
 }
+// Client not registered yet — buffer (may arrive before CLIENT_CONNECTED in serverless)
+eb, exists := h.earlyData[f.ClientID]
+if !exists {
+eb = &earlyBuffer{createdAt: time.Now()}
+h.earlyData[f.ClientID] = eb
+}
+eb.frames = append(eb.frames, msg)
+h.mu.Unlock()
+	log.Printf("[INFO] buffered early DATA_C2T for unregistered client clientID=%s seqID=%s buffered=%d", f.ClientID, f.SeqID, len(eb.frames))
+return
+}
 if cs.targetWS == nil {
-// Buffer while connecting
-cs.pending = append(cs.pending, pendingMsg{msgType: msgType, data: f.Payload})
+// Buffer while connecting (will be flushed in order by connectToTarget)
+cs.pending = append(cs.pending, msg)
 h.mu.Unlock()
 return
 }
@@ -160,10 +230,24 @@ func (h *Handler) onClientDisconnected(f protocol.Frame) {
 h.mu.Lock()
 cs, ok := h.clients[f.ClientID]
 if !ok {
+// Check if already closed
+if _, closed := h.closedIDs[f.ClientID]; closed {
 h.mu.Unlock()
 return
 }
+// May arrive before CLIENT_CONNECTED — mark in early buffer
+eb, exists := h.earlyData[f.ClientID]
+if !exists {
+eb = &earlyBuffer{createdAt: time.Now()}
+h.earlyData[f.ClientID] = eb
+}
+eb.disconnected = true
+h.mu.Unlock()
+	log.Printf("[INFO] buffered early DISCONNECT for unregistered client clientID=%s", f.ClientID)
+return
+}
 delete(h.clients, f.ClientID)
+h.closedIDs[f.ClientID] = time.Now()
 h.mu.Unlock()
 
 cs.cancel()
@@ -180,6 +264,7 @@ h.mu.Lock()
 _, ok := h.clients[clientID]
 if ok {
 delete(h.clients, clientID)
+h.closedIDs[clientID] = time.Now()
 }
 h.mu.Unlock()
 if ok {
@@ -224,5 +309,9 @@ if cs.targetWS != nil {
 cs.targetWS.Close()
 }
 delete(h.clients, id)
+h.closedIDs[id] = time.Now()
+}
+for id := range h.earlyData {
+delete(h.earlyData, id)
 }
 }

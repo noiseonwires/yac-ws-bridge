@@ -16,3 +16,6 @@ Thumbs.db
 
 .vs
 .vscode
+
+maui-client/bin
+maui-client/obj

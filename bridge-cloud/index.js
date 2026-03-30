@@ -101,20 +101,25 @@ async function wsSend(connId, data, type, token) {
 }
 
 // --- Protocol (string client IDs, no batching in v3) ---
-function encode(clientId, type, flags, payload) {
+// Wire: [2B cidLen][clientId][type][flags][2B seqLen][seqId][payload]
+function encode(clientId, type, flags, seqId, payload) {
   const cid = Buffer.from(clientId, 'utf-8');
-  const h = Buffer.alloc(2 + cid.length + 2);
+  const seq = Buffer.from(seqId || '', 'utf-8');
+  const h = Buffer.alloc(2 + cid.length + 2 + 2 + seq.length);
   h.writeUInt16BE(cid.length, 0);
   cid.copy(h, 2);
   h[2 + cid.length] = type;
   h[2 + cid.length + 1] = flags;
+  h.writeUInt16BE(seq.length, 2 + cid.length + 2);
+  seq.copy(h, 2 + cid.length + 4);
   return payload ? Buffer.concat([h, payload]) : h;
 }
 
 function decode(buf) {
   const cidLen = buf.readUInt16BE(0);
   const off = 2 + cidLen;
-  return { clientId: buf.subarray(2, 2+cidLen).toString('utf-8'), type: buf[off], flags: buf[off+1], payload: buf.subarray(off+2) };
+  const seqLen = buf.readUInt16BE(off + 2);
+  return { clientId: buf.subarray(2, 2+cidLen).toString('utf-8'), type: buf[off], flags: buf[off+1], seqId: buf.subarray(off+4, off+4+seqLen).toString('utf-8'), payload: buf.subarray(off+4+seqLen) };
 }
 
 // CLIENT_CONNECTED payload: [2B pathLen][path][2B subLen][sub][2B tokenLen][token]
@@ -136,16 +141,21 @@ const MSG_DATA_C2T=0x20, MSG_PING=0xF0, MSG_PONG=0xF1;
 const FLAG_TEXT=0x01;
 
 // Send frame to adapter via upstream WS, POST fallback if unavailable.
+// IMPORTANT: never block on fetchUpstreamConnId() here — the latency gap
+// between fast (wsSend ~5ms) and slow (fetch+wsSend ~200ms) paths causes
+// message reordering across CF instances. When connId is unknown, go straight
+// to POST (~15ms) and fetch connId in the background for subsequent calls.
 async function sendToAdapter(frame, iamToken) {
   if (upstreamConnId) {
     const st = await wsSend(upstreamConnId, frame, 'BINARY', iamToken);
     if (st < 400) return;
-    console.error('upstream WS send failed, status:', st, 'connId:', upstreamConnId, '- falling back to POST');
+    console.error('upstream WS send failed, status:', st, 'connId:', upstreamConnId);
     upstreamConnId = null;
+    // Don't retry with fetch — fall through to POST to minimize latency gap
   }
   // POST fallback — also triggers adapter to connect upstream
   if (!WAKEUP_URL) return;
-  console.log('sending frame via POST fallback');
+  console.log('sending frame via POST fallback, upstreamConnId:', upstreamConnId ? 'known' : 'unknown');
   try {
     const r = await httpPost(WAKEUP_URL, {
       'Content-Type': 'application/octet-stream',
@@ -163,9 +173,14 @@ async function forwardHTTP(event) {
   if (!WAKEUP_URL) return { statusCode: 502, body: 'no adapter URL configured' };
   const url = adapterUrl('proxy');
 
+  // API Gateway puts captured path in event.params.path (not event.path, which is the route template)
+  const actualPath = (event.params && event.params.path)
+    ? '/' + event.params.path
+    : event.url || event.path || '/';
+
   const proxyReq = {
     method: event.httpMethod || 'GET',
-    path: event.path || '/',
+    path: actualPath,
     queryString: event.queryStringParameters || {},
     headers: event.headers || {},
     body: event.body || '',
@@ -218,12 +233,12 @@ async function handle(event, context) {
         const ver = f.payload[0];
         const tok = f.payload.subarray(1).toString('utf-8');
         if (ver !== 1 || tok !== AUTH_TOKEN) {
-          return binaryResp(encode('', MSG_HELLO_ERR, 0, Buffer.from('auth failed')));
+          return binaryResp(encode('', MSG_HELLO_ERR, 0, '', Buffer.from('auth failed')));
         }
         console.log('adapter authenticated, upstream connId:', upstreamConnId);
-        return binaryResp(encode('', MSG_HELLO_OK, 0, Buffer.from(upstreamConnId || '')));
+        return binaryResp(encode('', MSG_HELLO_OK, 0, '', Buffer.from(upstreamConnId || '')));
       }
-      if (f.type === MSG_PING) return binaryResp(encode('', MSG_PONG, 0));
+      if (f.type === MSG_PING) return binaryResp(encode('', MSG_PONG, 0, ''));
       return { statusCode: 200 };
     }
     if (ev === 'DISCONNECT') {
@@ -243,12 +258,11 @@ async function handle(event, context) {
   if (ev === 'CONNECT') {
     const path = event.path || '/';
     const sub = getHeader(event.headers, 'Sec-WebSocket-Protocol');
-    console.log('client CONNECT:', connId, 'path:', path, 'subproto:', sub ? sub.substring(0,50)+'...' : '(none)', 'allHeaders:', JSON.stringify(Object.keys(event.headers || {})));
+    console.log('client CONNECT:', connId, 'path:', path, 'subproto:', sub ? sub.substring(0,50)+'...' : '(none)');
     const payload = encodeClientConnected(path, sub, token);
-    await sendToAdapter(encode(connId, MSG_CLIENT_CONNECTED, 0, payload), token);
+    await sendToAdapter(encode(connId, MSG_CLIENT_CONNECTED, 0, '', payload), token);
     const headers = {};
     if (sub) headers['Sec-WebSocket-Protocol'] = sub;
-    console.log('client CONNECT response headers:', JSON.stringify(headers).substring(0, 200));
     return { statusCode: 200, headers };
   }
 
@@ -256,13 +270,14 @@ async function handle(event, context) {
     const buf = event.isBase64Encoded ? Buffer.from(event.body,'base64') : Buffer.from(event.body||'');
     const ct = getHeader(event.headers, 'Content-Type');
     const isText = ct.startsWith('application/json') || ct.startsWith('text/');
-    console.log('client MSG:', connId, 'len:', buf.length, 'ct:', ct, 'isText:', isText, 'isBase64:', event.isBase64Encoded);
-    await sendToAdapter(encode(connId, MSG_DATA_C2T, isText ? FLAG_TEXT : 0, buf), token);
+    const rawMsgId = rc.messageId || '';
+    console.log('client MSG:', connId, 'len:', buf.length, 'messageId:', rawMsgId, 'isText:', isText);
+    await sendToAdapter(encode(connId, MSG_DATA_C2T, isText ? FLAG_TEXT : 0, rawMsgId, buf), token);
     return { statusCode: 200 };
   }
 
   if (ev === 'DISCONNECT') {
-    await sendToAdapter(encode(connId, MSG_CLIENT_DISCONNECTED, 0), token);
+    await sendToAdapter(encode(connId, MSG_CLIENT_DISCONNECTED, 0, ''), token);
     return { statusCode: 200 };
   }
 

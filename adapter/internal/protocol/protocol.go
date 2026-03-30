@@ -28,24 +28,31 @@ const (
 // Empty string for control messages (HELLO, PING, PONG).
 //
 // Wire format:
-//   [ClientID Len: 2 bytes uint16 BE] [ClientID: variable UTF-8] [Type: 1] [Flags: 1] [Payload: variable]
+//   [ClientID Len: 2 bytes uint16 BE] [ClientID: variable UTF-8] [Type: 1] [Flags: 1] [SeqID Len: 2 bytes uint16 BE] [SeqID: variable UTF-8] [Payload: variable]
+//
+// SeqID is the API Gateway messageId (string, incrementally ordered).
+// Empty for CONNECT, DISCONNECT, and control frames.
 type Frame struct {
 	ClientID string
 	Type     byte
 	Flags    byte
+	SeqID    string
 	Payload  []byte
 }
 
 // Encode serialises a Frame into a byte slice.
 func Encode(f Frame) []byte {
 	cidBytes := []byte(f.ClientID)
-	buf := make([]byte, 2+len(cidBytes)+2+len(f.Payload))
+	seqBytes := []byte(f.SeqID)
+	buf := make([]byte, 2+len(cidBytes)+2+2+len(seqBytes)+len(f.Payload))
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(cidBytes)))
 	copy(buf[2:], cidBytes)
 	off := 2 + len(cidBytes)
 	buf[off] = f.Type
 	buf[off+1] = f.Flags
-	copy(buf[off+2:], f.Payload)
+	binary.BigEndian.PutUint16(buf[off+2:off+4], uint16(len(seqBytes)))
+	copy(buf[off+4:], seqBytes)
+	copy(buf[off+4+len(seqBytes):], f.Payload)
 	return buf
 }
 
@@ -90,16 +97,22 @@ func Decode(data []byte) (Frame, error) {
 		return Frame{}, errors.New("frame too short")
 	}
 	cidLen := binary.BigEndian.Uint16(data[0:2])
-	if int(2+cidLen+2) > len(data) {
-		return Frame{}, errors.New("frame too short for client ID")
+	off := 2 + int(cidLen)
+	if off+4 > len(data) {
+		return Frame{}, errors.New("frame too short for header")
 	}
 	clientID := string(data[2 : 2+cidLen])
-	off := 2 + int(cidLen)
+	seqLen := binary.BigEndian.Uint16(data[off+2 : off+4])
+	if off+4+int(seqLen) > len(data) {
+		return Frame{}, errors.New("frame too short for seqID")
+	}
+	seqID := string(data[off+4 : off+4+int(seqLen)])
 	return Frame{
 		ClientID: clientID,
 		Type:     data[off],
 		Flags:    data[off+1],
-		Payload:  data[off+2:],
+		SeqID:    seqID,
+		Payload:  data[off+4+int(seqLen):],
 	}, nil
 }
 
