@@ -26,11 +26,11 @@ type Stream struct {
 
 // Manager tracks active streams and dispatches incoming frames.
 type Manager struct {
-	mu             sync.Mutex
-	streams        map[uint32]*Stream
-	nextID         atomic.Uint32 // helper-only: allocates stream IDs
-	send           SendFunc
-	CoalesceDelay  time.Duration // 0 = disabled
+	mu            sync.Mutex
+	streams       map[uint32]*Stream
+	nextID        atomic.Uint32 // helper-only: allocates stream IDs
+	send          SendFunc
+	CoalesceDelay time.Duration // 0 = disabled
 
 	// Per-stream send sequence counters (auto-incremented in SendFrame).
 	seqCounters sync.Map // streamID → *atomic.Uint32

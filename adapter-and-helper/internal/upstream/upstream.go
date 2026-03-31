@@ -1,4 +1,4 @@
-﻿package upstream
+package upstream
 
 import (
 	"context"
@@ -21,14 +21,14 @@ type Upstream struct {
 	cfg     *config.Config
 	handler FrameHandler
 
-	mu             sync.Mutex
-	writeMu        sync.Mutex // serializes all WebSocket writes
-	conn           *websocket.Conn
-	running        bool
-	ownConnID      string
-	peerConnID     string
-	staleConnID    string // last peer ID that failed wsSend
-	iamToken       string
+	mu          sync.Mutex
+	writeMu     sync.Mutex // serializes all WebSocket writes
+	conn        *websocket.Conn
+	running     bool
+	ownConnID   string
+	peerConnID  string
+	staleConnID string // last peer ID that failed wsSend
+	iamToken    string
 }
 
 func New(cfg *config.Config, handler FrameHandler) *Upstream {

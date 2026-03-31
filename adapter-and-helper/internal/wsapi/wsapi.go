@@ -1,4 +1,4 @@
-﻿package wsapi
+package wsapi
 
 // Client sends data to WebSocket connections via the YC management API.
 type Client interface {
