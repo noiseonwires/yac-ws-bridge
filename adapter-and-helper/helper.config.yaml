@@ -14,12 +14,9 @@ listen:
   address: "127.0.0.1:1080"
 
 
-# Nagle-like write coalescing: buffer small TCP reads into larger DATA frames.
-# Reduces wsSend calls and improves throughput. Flush on delayMs timeout or 32KB.
-writeCoalescing:
-  enabled: true
-  delayMs: 50
-
+# QUIC transport settings.
+quic:
+  mtu: 1200   # QUIC packet size (bytes). Keep ≤ 1200 for best compatibility.
 
 wsApi:
   mode: "grpc"

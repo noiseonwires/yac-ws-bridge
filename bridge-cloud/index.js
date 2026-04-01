@@ -1,6 +1,6 @@
 ﻿// Bridge to Freedom v4 — Yandex Cloud Function
 // Discovery service: exchanges connection IDs between adapter and helper.
-// Optionally relays helper's stream frames to the adapter (relay mode).
+// Optionally relays helper's QUIC packets to the adapter (relay mode).
 //
 // Env: AUTH_TOKEN (required), ADAPTER_URL (required — for /conn-ids fetch on init)
 
@@ -17,8 +17,7 @@ const httpAgent = new http.Agent({ keepAlive: true });
 const MSG_NAMES = {
   0x01: 'HELLO', 0x02: 'HELLO_OK', 0x03: 'HELLO_ERR',
   0x04: 'PEER_CONN', 0x05: 'PEER_GONE', 0x06: 'SYNC',
-  0x10: 'OPEN', 0x11: 'OPEN_OK', 0x12: 'OPEN_FAIL',
-  0x20: 'DATA', 0x21: 'FIN', 0x22: 'RST',
+  0x30: 'QUIC',
   0xF0: 'PING', 0xF1: 'PONG',
 };
 function msgName(type) { return MSG_NAMES[type] || '0x' + type.toString(16); }
@@ -35,13 +34,9 @@ const MSG_HELLO_ERR = 0x03;
 const MSG_PEER_CONN = 0x04;
 const MSG_PEER_GONE = 0x05;
 const MSG_SYNC      = 0x06;
+const MSG_QUIC      = 0x30;
 const MSG_PING      = 0xF0;
 const MSG_PONG      = 0xF1;
-const MSG_OPEN      = 0x10;
-const MSG_OPEN_FAIL = 0x12;
-const MSG_DATA      = 0x20;
-const MSG_FIN       = 0x21;
-const MSG_RST       = 0x22;
 
 // --- Helpers ---
 
@@ -163,17 +158,6 @@ function encodePong(iamToken) {
   return buf;
 }
 
-// Encode a stream-level frame (OPEN_FAIL, RST, etc.) with a specific streamId.
-function encodeStreamFrame(type, streamId, payload) {
-  const p = payload || Buffer.alloc(0);
-  const buf = Buffer.alloc(9 + p.length);
-  buf[0] = type;
-  buf.writeUInt32BE(streamId, 1);
-  buf.writeUInt32BE(0, 5); // seqID = 0
-  p.copy(buf, 9);
-  return buf;
-}
-
 function binaryResp(buf) {
   return { statusCode: 200, headers: { 'Content-Type': 'application/octet-stream' }, body: buf.toString('base64'), isBase64Encoded: true };
 }
@@ -290,26 +274,17 @@ async function handle(event, context) {
       const seqId = buf.readUInt32BE(5);
       console.log(`helper MESSAGE type=${msgName(type)} streamId=${streamId} seq=${seqId} len=${buf.length}`);
 
-      // Stream frames (type >= 0x10): relay to adapter
-      if (type >= 0x10) {
+      // QUIC packet (type 0x30): relay to adapter as-is
+      if (type === MSG_QUIC) {
         if (adapterConnId) {
-          console.log(`relay ${msgName(type)} streamId=${streamId} seq=${seqId} -> adapter ${adapterConnId} bytes=${buf.length}`);
+          console.log(`relay QUIC -> adapter ${adapterConnId} bytes=${buf.length}`);
           const st = await wsSend(adapterConnId, buf, token);
           if (st >= 400) {
-            console.error(`relay FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
+            console.error(`relay QUIC FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
             adapterConnId = null;
-            // Return error frame so helper doesn't wait forever
-            if (type === MSG_OPEN) {
-              return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('adapter unreachable')));
-            }
-            return binaryResp(encodeStreamFrame(MSG_RST, streamId));
           }
         } else {
-          console.warn(`relay DROP ${msgName(type)} streamId=${streamId}: no adapter connected`);
-          if (type === MSG_OPEN) {
-            return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('no adapter connected')));
-          }
-          return binaryResp(encodeStreamFrame(MSG_RST, streamId));
+          console.warn(`relay DROP QUIC: no adapter connected`);
         }
         return { statusCode: 200 };
       }

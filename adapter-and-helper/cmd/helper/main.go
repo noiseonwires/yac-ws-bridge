@@ -13,9 +13,11 @@ import (
 
 	"github.com/bridge-to-freedom/adapter/internal/config"
 	"github.com/bridge-to-freedom/adapter/internal/protocol"
+	"github.com/bridge-to-freedom/adapter/internal/quictun"
 	"github.com/bridge-to-freedom/adapter/internal/streams"
 	"github.com/bridge-to-freedom/adapter/internal/upstream"
 	"github.com/bridge-to-freedom/adapter/internal/wsapi"
+	"github.com/quic-go/quic-go"
 )
 
 func main() {
@@ -40,48 +42,58 @@ func main() {
 
 	var ups *upstream.Upstream
 
-	// pendingOpens tracks streams waiting for OPEN_OK/OPEN_FAIL.
-	var pendingMu sync.Mutex
-	pendingOpens := make(map[uint32]chan protocol.Frame)
-
-	// cancelPendingOpens closes all pending OPEN channels so blocked
-	// handleConn goroutines wake up and clean up. Used on PEER_GONE
-	// and PEER_CONN to avoid leaked goroutines after adapter restarts.
-	cancelPendingOpens := func(reason string) {
-		pendingMu.Lock()
-		count := len(pendingOpens)
-		for sid, ch := range pendingOpens {
-			close(ch)
-			delete(pendingOpens, sid)
-		}
-		pendingMu.Unlock()
-		if count > 0 {
-			log.Printf("[INFO] cancelled %d pending opens: %s", count, reason)
-		}
-	}
-
-	sm := streams.NewManager(func(data []byte) error {
+	// Virtual transport: outbound QUIC packets → wsSend or relay.
+	transport := quictun.NewTransport(func(data []byte) error {
+		frame := protocol.Encode(protocol.Frame{
+			Type:    protocol.MsgQUIC,
+			Payload: data,
+		})
 		if relay {
-			// Relay mode: send through upstream WS
-			return ups.Send(data)
+			return ups.Send(frame)
 		}
-		// Direct mode: wsSend to adapter
 		peerID := ups.PeerConnID()
 		token := ups.IAMToken()
 		if peerID == "" || token == "" {
 			return fmt.Errorf("no peer connected")
 		}
-		err := wsClient.Send(peerID, data, "BINARY", token)
+		err := wsClient.Send(peerID, frame, "BINARY", token)
 		if err != nil {
 			ups.MarkPeerStale()
 		}
 		return err
 	})
-	sm.CoalesceDelay = cfg.CoalesceDelay()
+
+	// QUIC connection to the adapter (managed with reconnection).
+	var quicMu sync.Mutex
+	var quicConn quic.Connection
+
+	getOrDialQUIC := func(ctx context.Context) (quic.Connection, error) {
+		quicMu.Lock()
+		defer quicMu.Unlock()
+		if quicConn != nil {
+			return quicConn, nil
+		}
+		log.Printf("[INFO] dialing QUIC to adapter (virtual transport)")
+		qc, err := quictun.DialQUIC(ctx, transport, cfg.MTU())
+		if err != nil {
+			return nil, fmt.Errorf("QUIC dial: %w", err)
+		}
+		quicConn = qc
+		log.Printf("[INFO] QUIC connection established")
+		return qc, nil
+	}
+
+	closeQUIC := func() {
+		quicMu.Lock()
+		defer quicMu.Unlock()
+		if quicConn != nil {
+			quicConn.CloseWithError(0, "peer gone")
+			quicConn = nil
+		}
+	}
 
 	ups = upstream.New(cfg, func(f protocol.Frame) {
 		switch f.Type {
-		// --- Control ---
 		case protocol.MsgPeerConn:
 			peerID, iamToken, err := protocol.DecodePeerConn(f.Payload)
 			if err != nil {
@@ -89,21 +101,21 @@ func main() {
 				return
 			}
 			if ups.IsStaleConnID(peerID) {
-				log.Printf("[WARN] PEER_CONN with stale ID %s, ignoring (waiting for fresh ID)", peerID)
+				log.Printf("[WARN] PEER_CONN with stale ID %s, ignoring", peerID)
 				return
 			}
 			ups.ClearStaleConnID()
-			cancelPendingOpens("new peer connected")
+			// New adapter connected — close old QUIC connection to force fresh handshake.
+			closeQUIC()
 			log.Printf("[INFO] PEER_CONN received: peerID=%s tokenLen=%d", peerID, len(iamToken))
 			ups.SetPeerConnID(peerID)
 			if iamToken != "" {
 				ups.SetIAMToken(iamToken)
 			}
 		case protocol.MsgPeerGone:
-			log.Printf("[INFO] PEER_GONE received, closing %d streams", sm.Count())
+			log.Printf("[INFO] PEER_GONE received")
 			ups.SetPeerConnID("")
-			cancelPendingOpens("peer gone")
-			sm.CloseAll()
+			closeQUIC()
 		case protocol.MsgPong:
 			iamToken, err := protocol.DecodePong(f.Payload)
 			if err != nil {
@@ -112,33 +124,10 @@ func main() {
 			}
 			log.Printf("[DEBUG] PONG received, tokenLen=%d", len(iamToken))
 			ups.SetIAMToken(iamToken)
-
-		// --- Stream responses ---
-		case protocol.MsgOpenOK, protocol.MsgOpenFail:
-			typeName := "OPEN_OK"
-			if f.Type == protocol.MsgOpenFail {
-				typeName = "OPEN_FAIL"
-			}
-			log.Printf("[INFO] %s received stream=%d", typeName, f.StreamID)
-			pendingMu.Lock()
-			ch, ok := pendingOpens[f.StreamID]
-			pendingMu.Unlock()
-			if ok {
-				ch <- f
-			} else {
-				log.Printf("[WARN] %s for unknown stream=%d", typeName, f.StreamID)
-			}
-
-		case protocol.MsgData:
-			sm.HandleData(f.StreamID, f.Payload)
-		case protocol.MsgFin:
-			log.Printf("[INFO] FIN received stream=%d seq=%d", f.StreamID, f.SeqID)
-			sm.HandleFin(f.StreamID)
-		case protocol.MsgRst:
-			log.Printf("[INFO] RST received stream=%d seq=%d", f.StreamID, f.SeqID)
-			sm.HandleRst(f.StreamID)
+		case protocol.MsgQUIC:
+			transport.Deliver(f.Payload)
 		default:
-			log.Printf("[WARN] unknown frame type=0x%02x stream=%d", f.Type, f.StreamID)
+			log.Printf("[WARN] unknown frame type=0x%02x", f.Type)
 		}
 	})
 
@@ -153,18 +142,18 @@ func main() {
 			log.Println("[WARN] graceful shutdown timed out, forcing exit")
 			os.Exit(1)
 		}()
-		sm.CloseAll()
+		closeQUIC()
+		transport.Close()
 		cancel()
 	}()
 
-	// TCP listener
+	// TCP listener — accept local connections and tunnel over QUIC.
 	ln, err := net.Listen("tcp", cfg.Listen.Address)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("[INFO] helper starting bridge=%s listen=%s relay=%v coalesce=%v", cfg.Bridge.URL, cfg.Listen.Address, relay, cfg.CoalesceDelay())
+	log.Printf("[INFO] helper starting bridge=%s listen=%s relay=%v mtu=%d", cfg.Bridge.URL, cfg.Listen.Address, relay, cfg.MTU())
 
-	// Accept loop in background
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -175,86 +164,48 @@ func main() {
 				log.Printf("[WARN] accept error: %v", err)
 				continue
 			}
-			go handleConn(ctx, conn, ups, sm, &pendingMu, pendingOpens, relay)
+			go handleConn(ctx, conn, ups, relay, getOrDialQUIC)
 		}
 	}()
 
-	// Close listener on shutdown
 	go func() { <-ctx.Done(); ln.Close() }()
 
-	// Run upstream (blocks until ctx cancelled)
 	ups.Run(ctx)
 }
 
-func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *streams.Manager, pendingMu *sync.Mutex, pendingOpens map[uint32]chan protocol.Frame, relay bool) {
+func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, relay bool, dialFn func(context.Context) (quic.Connection, error)) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
+	log.Printf("[INFO] new TCP connection remote=%s", conn.RemoteAddr())
 
-	sid := sm.NextID()
-	log.Printf("[INFO] new TCP connection remote=%s stream=%d", conn.RemoteAddr(), sid)
-
-	s := &streams.Stream{ID: sid, Conn: conn}
-
-	// Wait for peer readiness before sending OPEN
+	// Wait for peer to be available.
 	if !waitForPeer(ctx, ups, relay, 10*time.Second) {
-		log.Printf("[WARN] no peer available stream=%d, closing", sid)
+		log.Printf("[WARN] no peer available, closing connection")
 		conn.Close()
 		return
 	}
 
-	// Register pending open
-	ch := make(chan protocol.Frame, 1)
-	pendingMu.Lock()
-	pendingOpens[sid] = ch
-	pendingMu.Unlock()
-
-	defer func() {
-		pendingMu.Lock()
-		delete(pendingOpens, sid)
-		pendingMu.Unlock()
-	}()
-
-	// Send OPEN
-	if err := sm.SendFrame(protocol.Frame{Type: protocol.MsgOpen, StreamID: sid}); err != nil {
-		log.Printf("[WARN] send OPEN failed stream=%d err=%v", sid, err)
-		conn.Close()
-		return
-	}
-	log.Printf("[INFO] OPEN sent stream=%d, waiting for response...", sid)
-
-	// Wait for OPEN_OK or OPEN_FAIL (with timeout)
-	select {
-	case resp, ok := <-ch:
-		if !ok {
-			// Channel closed — peer disconnected/reconnected while we were waiting
-			log.Printf("[INFO] stream aborted during open (peer reset) stream=%d", sid)
-			conn.Close()
-			return
-		}
-		if resp.Type == protocol.MsgOpenFail {
-			log.Printf("[INFO] stream rejected stream=%d reason=%s", sid, string(resp.Payload))
-			conn.Close()
-			return
-		}
-		log.Printf("[INFO] stream opened stream=%d remote=%s", sid, conn.RemoteAddr())
-	case <-time.After(30 * time.Second):
-		log.Printf("[WARN] OPEN timeout stream=%d (no response in 30s)", sid)
-		conn.Close()
-		return
-	case <-ctx.Done():
-		log.Printf("[INFO] stream cancelled during open stream=%d", sid)
+	// Establish or reuse QUIC connection, open a stream.
+	qconn, err := dialFn(ctx)
+	if err != nil {
+		log.Printf("[WARN] QUIC dial failed: %v", err)
 		conn.Close()
 		return
 	}
 
-	// Stream is open
-	sm.Register(s)
-	sm.ReadLoop(s)
+	qs, err := qconn.OpenStreamSync(ctx)
+	if err != nil {
+		log.Printf("[WARN] QUIC open stream failed: %v", err)
+		conn.Close()
+		return
+	}
+
+	log.Printf("[INFO] QUIC stream opened id=%d remote=%s", qs.StreamID(), conn.RemoteAddr())
+	streams.Relay(qs, conn)
+	log.Printf("[INFO] stream finished id=%d", qs.StreamID())
 }
 
-// waitForPeer blocks until the peer is available (or relay mode), sending a
-// SYNC to speed up discovery. Returns false on timeout or cancellation.
 func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeout time.Duration) bool {
 	if relay {
 		return true
@@ -263,7 +214,6 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 		return true
 	}
 
-	// Send SYNC to ask the cloud function for the current adapter ID
 	log.Printf("[DEBUG] peer unknown, sending SYNC for discovery")
 	ups.SendSync()
 
@@ -285,3 +235,4 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 		}
 	}
 }
+

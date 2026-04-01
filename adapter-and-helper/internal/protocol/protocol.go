@@ -17,18 +17,13 @@ const (
 	MsgPong     byte = 0xF1
 )
 
-// Message types — stream (streamID > 0).
-const (
-	MsgOpen     byte = 0x10
-	MsgOpenOK   byte = 0x11
-	MsgOpenFail byte = 0x12
-	MsgData     byte = 0x20
-	MsgFin      byte = 0x21
-	MsgRst      byte = 0x22
-)
+// MsgQUIC carries a raw QUIC packet over the WebSocket bridge.
+// Wire: [1B type=0x30][payload = raw QUIC packet]
+const MsgQUIC byte = 0x30
 
 // Frame is a single protocol message.
 // Wire: [1B type][4B streamID BE][4B seqID BE][payload...]
+// For MsgQUIC, streamID and seqID are always 0; payload is the raw QUIC packet.
 type Frame struct {
 	Type     byte
 	StreamID uint32
