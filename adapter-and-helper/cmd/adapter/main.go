@@ -44,6 +44,7 @@ func main() {
 	var ups *upstream.Upstream
 
 	// Virtual transport: outbound QUIC packets → wsSend (gRPC) to helper.
+	// Async send workers decouple QUIC pacing from wsSend latency.
 	transport := quictun.NewTransport(func(data []byte) error {
 		peerID := ups.PeerConnID()
 		token := ups.IAMToken()
@@ -59,7 +60,7 @@ func main() {
 			ups.MarkPeerStale()
 		}
 		return err
-	})
+	}, cfg.SendWorkers())
 
 	ups = upstream.New(cfg, func(f protocol.Frame) {
 		switch f.Type {
@@ -155,7 +156,7 @@ func main() {
 	// Start QUIC server (adapter side accepts QUIC connections from helper).
 	go runQUICServer(ctx, cfg, transport)
 
-	log.Printf("[INFO] adapter starting bridge=%s target=%s mtu=%d", cfg.Bridge.URL, cfg.Target.Address, cfg.MTU())
+	log.Printf("[INFO] adapter starting bridge=%s target=%s mtu=%d sendWorkers=%d", cfg.Bridge.URL, cfg.Target.Address, cfg.MTU(), cfg.SendWorkers())
 	ups.Run(ctx)
 }
 

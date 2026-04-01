@@ -32,7 +32,8 @@ type Config struct {
 		Relay bool   `yaml:"relay"`
 	} `yaml:"wsApi"`
 	QUIC struct {
-		MTU int `yaml:"mtu"`
+		MTU         int `yaml:"mtu"`
+		SendWorkers int `yaml:"sendWorkers"`
 	} `yaml:"quic"`
 	Logging struct {
 		Level string `yaml:"level"`
@@ -56,6 +57,13 @@ func (c *Config) MTU() int {
 		return 1200
 	}
 	return c.QUIC.MTU
+}
+
+func (c *Config) SendWorkers() int {
+	if c.QUIC.SendWorkers <= 0 {
+		return 8
+	}
+	return c.QUIC.SendWorkers
 }
 
 func Load(path string) (*Config, error) {

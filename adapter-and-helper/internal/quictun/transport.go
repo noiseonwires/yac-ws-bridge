@@ -1,9 +1,14 @@
 // Package quictun provides a virtual net.PacketConn that tunnels QUIC packets
 // over the WebSocket bridge. Instead of real UDP, QUIC packets are sent via
 // wsSend (gRPC API) or relayed through the cloud function, depending on config.
+//
+// Performance-critical: WriteTo is made non-blocking by using an async send
+// queue. This prevents QUIC's congestion controller from misinterpreting
+// gRPC/REST call latency as network RTT.
 package quictun
 
 import (
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -22,26 +27,54 @@ type Transport struct {
 
 	mu       sync.Mutex
 	closed   bool
-	readCh   chan []byte      // incoming QUIC packets
+	readCh   chan []byte // incoming QUIC packets
 	closeCh  chan struct{}
 	deadline time.Time
 
-	send SendFunc
+	// Async send queue: WriteTo pushes packets here, background workers
+	// drain and send via the bridge. This decouples QUIC pacing from
+	// wsSend latency so the congestion controller sees sub-ms "RTT".
+	sendCh      chan []byte
+	sendWorkers int
+	send        SendFunc
 
 	// quic.Transport is created once and reused across Listen/Dial calls.
 	quicOnce      sync.Once
 	quicTransport *quic.Transport
 }
 
-// NewTransport creates a virtual packet connection.
-// mtu is used to size internal buffers. sendFn delivers outbound packets.
-func NewTransport(sendFn SendFunc) *Transport {
-	return &Transport{
-		localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
-		peerAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 1},
-		readCh:    make(chan []byte, 512),
-		closeCh:   make(chan struct{}),
-		send:      sendFn,
+// NewTransport creates a virtual packet connection with async sending.
+// sendWorkers controls concurrency of outbound wsSend calls (default 8).
+func NewTransport(sendFn SendFunc, sendWorkers int) *Transport {
+	if sendWorkers <= 0 {
+		sendWorkers = 8
+	}
+	t := &Transport{
+		localAddr:   &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		peerAddr:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 1},
+		readCh:      make(chan []byte, 2048),
+		closeCh:     make(chan struct{}),
+		sendCh:      make(chan []byte, 2048),
+		sendWorkers: sendWorkers,
+		send:        sendFn,
+	}
+	// Start send workers.
+	for i := 0; i < sendWorkers; i++ {
+		go t.sendLoop()
+	}
+	return t
+}
+
+func (t *Transport) sendLoop() {
+	for {
+		select {
+		case <-t.closeCh:
+			return
+		case pkt := <-t.sendCh:
+			if err := t.send(pkt); err != nil {
+				log.Printf("[DEBUG] transport send: %v", err)
+			}
+		}
 	}
 }
 
@@ -82,18 +115,23 @@ func (t *Transport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 }
 
-// WriteTo sends a QUIC packet through the bridge.
+// WriteTo queues a QUIC packet for async sending through the bridge.
+// Returns immediately so QUIC's congestion controller is not blocked
+// by wsSend latency. If the send queue is full, the packet is dropped
+// (QUIC will retransmit).
 func (t *Transport) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	select {
 	case <-t.closeCh:
 		return 0, net.ErrClosed
 	default:
 	}
-	// Copy data since QUIC may reuse the buffer.
 	buf := make([]byte, len(p))
 	copy(buf, p)
-	if err := t.send(buf); err != nil {
-		return 0, err
+	select {
+	case t.sendCh <- buf:
+	default:
+		// Send queue full — drop. QUIC retransmits.
+		log.Printf("[DEBUG] send queue full, dropping packet len=%d", len(buf))
 	}
 	return len(p), nil
 }

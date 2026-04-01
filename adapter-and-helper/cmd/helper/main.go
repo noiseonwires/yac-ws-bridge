@@ -43,6 +43,7 @@ func main() {
 	var ups *upstream.Upstream
 
 	// Virtual transport: outbound QUIC packets → wsSend or relay.
+	// Async send workers decouple QUIC pacing from wsSend latency.
 	transport := quictun.NewTransport(func(data []byte) error {
 		frame := protocol.Encode(protocol.Frame{
 			Type:    protocol.MsgQUIC,
@@ -61,7 +62,7 @@ func main() {
 			ups.MarkPeerStale()
 		}
 		return err
-	})
+	}, cfg.SendWorkers())
 
 	// QUIC connection to the adapter (managed with reconnection).
 	var quicMu sync.Mutex
@@ -152,7 +153,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("[INFO] helper starting bridge=%s listen=%s relay=%v mtu=%d", cfg.Bridge.URL, cfg.Listen.Address, relay, cfg.MTU())
+	log.Printf("[INFO] helper starting bridge=%s listen=%s relay=%v mtu=%d sendWorkers=%d", cfg.Bridge.URL, cfg.Listen.Address, relay, cfg.MTU(), cfg.SendWorkers())
 
 	go func() {
 		for {

@@ -20,7 +20,8 @@ http:
 
 # QUIC transport settings.
 quic:
-  mtu: 1200   # QUIC packet size (bytes). Keep ≤ 1200 for best compatibility.
+  mtu: 1200         # QUIC packet size (bytes). Default 1200. Can go up to ~65K over WS.
+  sendWorkers: 8     # Concurrent wsSend goroutines. More = higher throughput, more API load.
 
 wsApi:
   mode: "grpc"

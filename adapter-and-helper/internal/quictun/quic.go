@@ -17,45 +17,59 @@ import (
 // DefaultMTU is the default maximum QUIC packet size.
 const DefaultMTU = 1200
 
-// ServerConfig returns a quic.Transport + quic.Listener for the adapter side.
-// The adapter acts as the QUIC server: the helper dials into it.
-func ServerConfig(mtu int) (*tls.Config, *quic.Config) {
+// quicConfig returns tuned QUIC settings for high-latency virtual transport.
+//
+// Key tuning vs defaults:
+//   - InitialPacketSize = MTU: skip PMTUD, we know exact path capacity
+//   - DisablePathMTUDiscovery: no real UDP path, PMTUD wastes round-trips
+//   - InitialStreamReceiveWindow: 8MB — large window for high BDP
+//   - InitialConnectionReceiveWindow: 16MB — connection-level flow control
+//   - MaxIdleTimeout: 120s — tolerant of WS reconnections
+//   - KeepAlivePeriod: 20s — below typical WS idle timeout (60s)
+//   - Allow0RTT on server: skips 1-RTT handshake on reconnect
+func quicConfig(mtu int) *quic.Config {
 	if mtu <= 0 {
 		mtu = DefaultMTU
 	}
+	return &quic.Config{
+		MaxIdleTimeout:  120 * time.Second,
+		KeepAlivePeriod: 20 * time.Second,
+
+		InitialPacketSize:       uint16(mtu),
+		DisablePathMTUDiscovery: true,
+
+		// Large flow control windows — the virtual transport has no real
+		// bandwidth limit; the bottleneck is wsSend call rate. Large windows
+		// let QUIC push data without waiting for window updates.
+		InitialStreamReceiveWindow:     8 << 20, // 8 MiB per stream
+		MaxStreamReceiveWindow:         16 << 20, // 16 MiB per stream
+		InitialConnectionReceiveWindow: 16 << 20, // 16 MiB total
+		MaxConnectionReceiveWindow:     32 << 20, // 32 MiB total
+
+		MaxIncomingStreams:    1 << 20,
+		MaxIncomingUniStreams: 1 << 20,
+
+		// Allow 0-RTT for faster stream opens on reconnection.
+		Allow0RTT: true,
+	}
+}
+
+// ServerConfig returns TLS + QUIC configs for the adapter (QUIC server) side.
+func ServerConfig(mtu int) (*tls.Config, *quic.Config) {
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{selfSignedCert()},
 		NextProtos:   []string{"btf-quic"},
 	}
-	quicCfg := &quic.Config{
-		MaxIdleTimeout:                 60 * time.Second,
-		KeepAlivePeriod:                15 * time.Second,
-		InitialPacketSize:              uint16(mtu),
-		DisablePathMTUDiscovery:        true,
-		MaxIncomingStreams:             1 << 20,
-		MaxIncomingUniStreams:          1 << 20,
-	}
-	return tlsCfg, quicCfg
+	return tlsCfg, quicConfig(mtu)
 }
 
-// ClientConfig returns TLS + QUIC configs for the helper side.
+// ClientConfig returns TLS + QUIC configs for the helper (QUIC client) side.
 func ClientConfig(mtu int) (*tls.Config, *quic.Config) {
-	if mtu <= 0 {
-		mtu = DefaultMTU
-	}
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: true, // Self-signed cert, verified by auth token.
 		NextProtos:         []string{"btf-quic"},
 	}
-	quicCfg := &quic.Config{
-		MaxIdleTimeout:                 60 * time.Second,
-		KeepAlivePeriod:                15 * time.Second,
-		InitialPacketSize:              uint16(mtu),
-		DisablePathMTUDiscovery:        true,
-		MaxIncomingStreams:             1 << 20,
-		MaxIncomingUniStreams:          1 << 20,
-	}
-	return tlsCfg, quicCfg
+	return tlsCfg, quicConfig(mtu)
 }
 
 // ListenQUIC creates a QUIC listener on top of the virtual transport.

@@ -11,6 +11,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// copyBufSize is the buffer size for relay copies.
+// Large buffer reduces syscall overhead and lets QUIC send larger frames.
+const copyBufSize = 256 * 1024 // 256 KiB
+
 // Relay copies data bidirectionally between a QUIC stream and a TCP connection.
 // It closes both sides when either direction finishes.
 func Relay(qs quic.Stream, tc net.Conn) {
@@ -24,10 +28,10 @@ func Relay(qs quic.Stream, tc net.Conn) {
 	// QUIC → TCP
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(tc, qs); err != nil {
+		buf := make([]byte, copyBufSize)
+		if _, err := io.CopyBuffer(tc, qs, buf); err != nil {
 			log.Printf("[DEBUG] quic→tcp err stream=%d: %v", qs.StreamID(), err)
 		}
-		// Signal TCP that no more data is coming.
 		if t, ok := tc.(*net.TCPConn); ok {
 			t.CloseWrite()
 		}
@@ -36,10 +40,10 @@ func Relay(qs quic.Stream, tc net.Conn) {
 	// TCP → QUIC
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(qs, tc); err != nil {
+		buf := make([]byte, copyBufSize)
+		if _, err := io.CopyBuffer(qs, tc, buf); err != nil {
 			log.Printf("[DEBUG] tcp→quic err stream=%d: %v", qs.StreamID(), err)
 		}
-		// Signal QUIC that no more data is coming.
 		qs.Close()
 	}()
 
