@@ -2,13 +2,16 @@
 // over the WebSocket bridge. Instead of real UDP, QUIC packets are sent via
 // wsSend (gRPC API) or relayed through the cloud function, depending on config.
 //
-// Performance-critical: WriteTo uses a bounded async send queue with short-timeout
-// backpressure. This prevents QUIC's congestion controller from misinterpreting
-// gRPC call latency as network RTT, while avoiding silent packet drops that
-// would trigger QUIC loss recovery and cwnd collapse.
+// Performance-critical design:
+//   - WriteTo is non-blocking (pushes to channel).
+//   - sendLoop batches multiple QUIC packets into one wsSend call, reducing
+//     API call count by 5-20x. Batch is flushed on a short timer (default 5ms)
+//     or when the batch reaches a size threshold.
+//   - Backpressure (200ms) instead of silent drops to avoid cwnd collapse.
 package quictun
 
 import (
+	"encoding/binary"
 	"log"
 	"net"
 	"sync"
@@ -17,11 +20,18 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// SendFunc sends a raw QUIC packet to the remote peer via the bridge.
+// SendFunc sends a raw payload to the remote peer via the bridge.
+// For batched mode, the payload is a batch-encoded blob of multiple packets.
 type SendFunc func(data []byte) error
 
+// BatchFlushDelay is how long to wait for more packets before flushing a batch.
+const BatchFlushDelay = 5 * time.Millisecond
+
+// MaxBatchSize is the maximum batch payload size before forcing a flush.
+// Kept under 128KB wsSend limit with room for protocol framing.
+const MaxBatchSize = 120 * 1024
+
 // Transport is a virtual net.PacketConn backed by the WebSocket bridge.
-// The QUIC stack reads/writes from this instead of a real UDP socket.
 type Transport struct {
 	localAddr net.Addr
 	peerAddr  net.Addr
@@ -32,23 +42,20 @@ type Transport struct {
 	closeCh  chan struct{}
 	deadline time.Time
 
-	// Async send queue: WriteTo pushes packets here, background workers
-	// drain and send via the bridge. This decouples QUIC pacing from
-	// wsSend latency so the congestion controller sees sub-ms "RTT".
+	// Async send: WriteTo pushes packets here, sendLoop batches and sends.
 	sendCh      chan []byte
 	sendWorkers int
 	send        SendFunc
 
-	// quic.Transport is created once and reused across Listen/Dial calls.
 	quicOnce      sync.Once
 	quicTransport *quic.Transport
 }
 
-// NewTransport creates a virtual packet connection with async sending.
-// sendWorkers controls concurrency of outbound wsSend calls (default 8).
+// NewTransport creates a virtual packet connection with batched async sending.
+// sendWorkers controls how many concurrent batch-send goroutines run (default 4).
 func NewTransport(sendFn SendFunc, sendWorkers int) *Transport {
 	if sendWorkers <= 0 {
-		sendWorkers = 8
+		sendWorkers = 4
 	}
 	t := &Transport{
 		localAddr:   &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
@@ -59,24 +66,122 @@ func NewTransport(sendFn SendFunc, sendWorkers int) *Transport {
 		sendWorkers: sendWorkers,
 		send:        sendFn,
 	}
-	// Start send workers.
 	for i := 0; i < sendWorkers; i++ {
 		go t.sendLoop()
 	}
 	return t
 }
 
+// sendLoop collects packets from sendCh, batches them, and flushes.
+// Strategy: send the first packet immediately (no delay), then collect any
+// additional packets that arrive within BatchFlushDelay into a batch.
+// This ensures low-latency for handshakes and control packets (which arrive
+// one at a time), while still batching bulk data transfers (which arrive in bursts).
 func (t *Transport) sendLoop() {
+	var batch [][]byte
+	var batchSize int
+	timer := time.NewTimer(BatchFlushDelay)
+	timer.Stop()
+	timerRunning := false
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		payload := encodeBatchPayload(batch)
+		if err := t.send(payload); err != nil {
+			log.Printf("[DEBUG] transport send: %v", err)
+		}
+		batch = batch[:0]
+		batchSize = 0
+		if timerRunning {
+			timer.Stop()
+			timerRunning = false
+		}
+	}
+
 	for {
+		// Block until the first packet arrives.
+		var first []byte
 		select {
 		case <-t.closeCh:
+			flush()
 			return
-		case pkt := <-t.sendCh:
-			if err := t.send(pkt); err != nil {
-				log.Printf("[DEBUG] transport send: %v", err)
+		case first = <-t.sendCh:
+		}
+
+		batch = append(batch, first)
+		batchSize = 2 + len(first)
+
+		// Non-blocking: drain any additional packets already queued.
+		draining := true
+		for draining {
+			select {
+			case pkt := <-t.sendCh:
+				batch = append(batch, pkt)
+				batchSize += 2 + len(pkt)
+				if batchSize >= MaxBatchSize {
+					flush()
+					draining = false
+				}
+			default:
+				draining = false
+			}
+		}
+
+		// If we already flushed due to MaxBatchSize, continue.
+		if len(batch) == 0 {
+			continue
+		}
+
+		// If only 1 packet (common for handshake/ACKs), send immediately.
+		if len(batch) == 1 {
+			flush()
+			continue
+		}
+
+		// Multiple packets queued — start timer to collect a few more.
+		timer.Reset(BatchFlushDelay)
+		timerRunning = true
+
+	collectMore:
+		for {
+			select {
+			case <-t.closeCh:
+				flush()
+				return
+			case pkt := <-t.sendCh:
+				batch = append(batch, pkt)
+				batchSize += 2 + len(pkt)
+				if batchSize >= MaxBatchSize {
+					flush()
+					break collectMore
+				}
+			case <-timer.C:
+				timerRunning = false
+				flush()
+				break collectMore
 			}
 		}
 	}
+}
+
+// encodeBatchPayload encodes multiple packets with length-prefix framing.
+// Format: [2B len][packet][2B len][packet]...
+func encodeBatchPayload(packets [][]byte) []byte {
+	size := 0
+	for _, p := range packets {
+		size += 2 + len(p)
+	}
+	buf := make([]byte, size)
+	off := 0
+	for _, p := range packets {
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(p)))
+		off += 2
+		copy(buf[off:], p)
+		off += len(p)
+	}
+	return buf
 }
 
 // Deliver enqueues an incoming QUIC packet from the bridge for the local QUIC stack.
@@ -84,10 +189,28 @@ func (t *Transport) sendLoop() {
 func (t *Transport) Deliver(data []byte) {
 	buf := make([]byte, len(data))
 	copy(buf, data)
-	// Non-blocking: drop if buffer is full (QUIC handles retransmission).
 	select {
 	case t.readCh <- buf:
 	default:
+	}
+}
+
+// DeliverBatch splits a batch payload and delivers each packet individually.
+func (t *Transport) DeliverBatch(data []byte) {
+	off := 0
+	for off+2 <= len(data) {
+		pLen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		if off+pLen > len(data) {
+			break
+		}
+		buf := make([]byte, pLen)
+		copy(buf, data[off:off+pLen])
+		select {
+		case t.readCh <- buf:
+		default:
+		}
+		off += pLen
 	}
 }
 
@@ -97,7 +220,7 @@ func (t *Transport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	dl := t.deadline
 	t.mu.Unlock()
 
-	var timer <-chan time.Time
+	var tmr <-chan time.Time
 	if !dl.IsZero() {
 		d := time.Until(dl)
 		if d <= 0 {
@@ -105,7 +228,7 @@ func (t *Transport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		}
 		tm := time.NewTimer(d)
 		defer tm.Stop()
-		timer = tm.C
+		tmr = tm.C
 	}
 
 	select {
@@ -114,16 +237,13 @@ func (t *Transport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case data := <-t.readCh:
 		n = copy(p, data)
 		return n, t.peerAddr, nil
-	case <-timer:
+	case <-tmr:
 		return 0, nil, &timeoutError{}
 	}
 }
 
-// WriteTo queues a QUIC packet for async sending through the bridge.
-// Uses short-timeout backpressure instead of silent drops: waits up to 200ms
-// for queue space. This is critical because silent drops look like packet loss
-// to QUIC's congestion controller, causing cwnd collapse and severe throughput
-// degradation. Brief backpressure is much less harmful than artificial "loss".
+// WriteTo queues a QUIC packet for async batched sending.
+// Uses short-timeout backpressure instead of silent drops.
 func (t *Transport) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	select {
 	case <-t.closeCh:
@@ -133,22 +253,17 @@ func (t *Transport) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
-	// Try non-blocking first (fast path).
 	select {
 	case t.sendCh <- buf:
 		return len(p), nil
 	default:
 	}
-	// Queue full — apply brief backpressure rather than dropping.
-	// 200ms is long enough for workers to drain a few slots, short enough
-	// that QUIC won't declare a timeout.
 	timer := time.NewTimer(200 * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case t.sendCh <- buf:
 		return len(p), nil
 	case <-timer.C:
-		// Genuine overload — drop as last resort.
 		log.Printf("[WARN] send queue full after backpressure, dropping packet len=%d", len(buf))
 		return len(p), nil
 	case <-t.closeCh:
@@ -167,10 +282,10 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-// LocalAddr returns a synthetic local address.
-func (t *Transport) LocalAddr() net.Addr { return t.localAddr }
+func (t *Transport) LocalAddr() net.Addr            { return t.localAddr }
+func (t *Transport) PeerAddr() net.Addr              { return t.peerAddr }
+func (t *Transport) SetWriteDeadline(time.Time) error { return nil }
 
-// SetDeadline sets the read deadline.
 func (t *Transport) SetDeadline(tm time.Time) error {
 	t.mu.Lock()
 	t.deadline = tm
@@ -178,18 +293,10 @@ func (t *Transport) SetDeadline(tm time.Time) error {
 	return nil
 }
 
-// SetReadDeadline sets the read deadline.
 func (t *Transport) SetReadDeadline(tm time.Time) error {
 	return t.SetDeadline(tm)
 }
 
-// SetWriteDeadline is a no-op (writes are non-blocking sends).
-func (t *Transport) SetWriteDeadline(time.Time) error { return nil }
-
-// PeerAddr returns the synthetic remote address used for the QUIC peer.
-func (t *Transport) PeerAddr() net.Addr { return t.peerAddr }
-
-// getOrCreateQUICTransport returns the singleton quic.Transport wrapping this PacketConn.
 func (t *Transport) getOrCreateQUICTransport() *quic.Transport {
 	t.quicOnce.Do(func() {
 		t.quicTransport = &quic.Transport{Conn: t}

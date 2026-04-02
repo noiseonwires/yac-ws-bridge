@@ -32,8 +32,12 @@ func quicConfig(mtu int) *quic.Config {
 		mtu = DefaultMTU
 	}
 	return &quic.Config{
-		MaxIdleTimeout:  120 * time.Second,
-		KeepAlivePeriod: 20 * time.Second,
+		// Very long idle timeout since we don't use QUIC keepalive.
+		MaxIdleTimeout: 600 * time.Second,
+		// Explicit handshake timeout — don't inherit the 600s idle timeout.
+		HandshakeIdleTimeout: 30 * time.Second,
+		// No QUIC-level keepalive — we use WS-level PING/PONG for liveness.
+		KeepAlivePeriod: 0,
 
 		InitialPacketSize:       uint16(mtu),
 		DisablePathMTUDiscovery: true,

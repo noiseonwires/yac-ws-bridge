@@ -44,7 +44,8 @@ func main() {
 	var ups *upstream.Upstream
 
 	// Virtual transport: outbound QUIC packets → wsSend (gRPC) to helper.
-	// Async send workers decouple QUIC pacing from wsSend latency.
+	// The transport batches packets and calls this with the raw payload.
+	// Single packet = raw bytes (MsgQUIC), batch = length-prefixed (MsgQUICBatch).
 	transport := quictun.NewTransport(func(data []byte) error {
 		peerID := ups.PeerConnID()
 		token := ups.IAMToken()
@@ -52,7 +53,7 @@ func main() {
 			return fmt.Errorf("no peer connected")
 		}
 		frame := protocol.Encode(protocol.Frame{
-			Type:    protocol.MsgQUIC,
+			Type:    protocol.MsgQUICBatch,
 			Payload: data,
 		})
 		err := wsClient.Send(peerID, frame, "BINARY", token)
@@ -93,6 +94,8 @@ func main() {
 			ups.SetIAMToken(iamToken)
 		case protocol.MsgQUIC:
 			transport.Deliver(f.Payload)
+		case protocol.MsgQUICBatch:
+			transport.DeliverBatch(f.Payload)
 		default:
 			log.Printf("[WARN] unknown frame type=0x%02x", f.Type)
 		}

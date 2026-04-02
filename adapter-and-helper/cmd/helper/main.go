@@ -43,10 +43,10 @@ func main() {
 	var ups *upstream.Upstream
 
 	// Virtual transport: outbound QUIC packets → wsSend or relay.
-	// Async send workers decouple QUIC pacing from wsSend latency.
+	// The transport batches packets with length-prefix framing.
 	transport := quictun.NewTransport(func(data []byte) error {
 		frame := protocol.Encode(protocol.Frame{
-			Type:    protocol.MsgQUIC,
+			Type:    protocol.MsgQUICBatch,
 			Payload: data,
 		})
 		if relay {
@@ -145,6 +145,8 @@ func main() {
 			ups.SetIAMToken(iamToken)
 		case protocol.MsgQUIC:
 			transport.Deliver(f.Payload)
+		case protocol.MsgQUICBatch:
+			transport.DeliverBatch(f.Payload)
 		default:
 			log.Printf("[WARN] unknown frame type=0x%02x", f.Type)
 		}

@@ -18,8 +18,50 @@ const (
 )
 
 // MsgQUIC carries a raw QUIC packet over the WebSocket bridge.
-// Wire: [1B type=0x30][payload = raw QUIC packet]
+// Wire: [1B type=0x30][4B 0][4B 0][raw QUIC packet]
 const MsgQUIC byte = 0x30
+
+// MsgQUICBatch carries multiple QUIC packets in one message.
+// Wire: [1B type=0x31][4B 0][4B 0][batch payload]
+// Batch payload: [2B len1][pkt1][2B len2][pkt2]...
+const MsgQUICBatch byte = 0x31
+
+// EncodeBatch encodes multiple QUIC packets into a batch payload.
+// Format: [2B len][packet][2B len][packet]...
+func EncodeBatch(packets [][]byte) []byte {
+	size := 0
+	for _, p := range packets {
+		size += 2 + len(p)
+	}
+	buf := make([]byte, size)
+	off := 0
+	for _, p := range packets {
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(p)))
+		off += 2
+		copy(buf[off:], p)
+		off += len(p)
+	}
+	return buf
+}
+
+// DecodeBatch splits a batch payload into individual QUIC packets.
+func DecodeBatch(data []byte) ([][]byte, error) {
+	var packets [][]byte
+	off := 0
+	for off < len(data) {
+		if off+2 > len(data) {
+			return nil, errors.New("batch: truncated length")
+		}
+		pLen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		if off+pLen > len(data) {
+			return nil, errors.New("batch: truncated packet")
+		}
+		packets = append(packets, data[off:off+pLen])
+		off += pLen
+	}
+	return packets, nil
+}
 
 // Frame is a single protocol message.
 // Wire: [1B type][4B streamID BE][4B seqID BE][payload...]

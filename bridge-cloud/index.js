@@ -17,7 +17,7 @@ const httpAgent = new http.Agent({ keepAlive: true });
 const MSG_NAMES = {
   0x01: 'HELLO', 0x02: 'HELLO_OK', 0x03: 'HELLO_ERR',
   0x04: 'PEER_CONN', 0x05: 'PEER_GONE', 0x06: 'SYNC',
-  0x30: 'QUIC',
+  0x30: 'QUIC', 0x31: 'QUIC_BATCH',
   0xF0: 'PING', 0xF1: 'PONG',
 };
 function msgName(type) { return MSG_NAMES[type] || '0x' + type.toString(16); }
@@ -36,6 +36,7 @@ const MSG_PEER_CONN = 0x04;
 const MSG_PEER_GONE = 0x05;
 const MSG_SYNC      = 0x06;
 const MSG_QUIC      = 0x30;
+const MSG_QUIC_BATCH = 0x31;
 const MSG_PING      = 0xF0;
 const MSG_PONG      = 0xF1;
 
@@ -290,18 +291,18 @@ async function handle(event, context) {
       const seqId = buf.readUInt32BE(5);
       console.log(`helper MESSAGE type=${msgName(type)} streamId=${streamId} seq=${seqId} len=${buf.length}`);
 
-      // QUIC packet (type 0x30): relay to adapter as-is
-      if (type === MSG_QUIC) {
+      // QUIC packet (type 0x30) or batch (0x31): relay to adapter as-is
+      if (type === MSG_QUIC || type === MSG_QUIC_BATCH) {
         if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
-          console.log(`relay QUIC -> adapter ${adapterConnId} bytes=${buf.length}`);
+          console.log(`relay ${msgName(type)} -> adapter ${adapterConnId} bytes=${buf.length}`);
           const st = await wsSend(adapterConnId, buf, token);
           if (st >= 400) {
-            console.error(`relay QUIC FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
+            console.error(`relay ${msgName(type)} FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
             adapterConnId = null;
           }
         } else {
-          console.warn(`relay DROP QUIC: no adapter connected`);
+          console.warn(`relay DROP ${msgName(type)}: no adapter connected`);
         }
         return { statusCode: 200 };
       }
