@@ -2,9 +2,10 @@
 // over the WebSocket bridge. Instead of real UDP, QUIC packets are sent via
 // wsSend (gRPC API) or relayed through the cloud function, depending on config.
 //
-// Performance-critical: WriteTo is made non-blocking by using an async send
-// queue. This prevents QUIC's congestion controller from misinterpreting
-// gRPC/REST call latency as network RTT.
+// Performance-critical: WriteTo uses a bounded async send queue with short-timeout
+// backpressure. This prevents QUIC's congestion controller from misinterpreting
+// gRPC call latency as network RTT, while avoiding silent packet drops that
+// would trigger QUIC loss recovery and cwnd collapse.
 package quictun
 
 import (
@@ -52,9 +53,9 @@ func NewTransport(sendFn SendFunc, sendWorkers int) *Transport {
 	t := &Transport{
 		localAddr:   &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
 		peerAddr:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 1},
-		readCh:      make(chan []byte, 2048),
+		readCh:      make(chan []byte, 4096),
 		closeCh:     make(chan struct{}),
-		sendCh:      make(chan []byte, 2048),
+		sendCh:      make(chan []byte, 4096),
 		sendWorkers: sendWorkers,
 		send:        sendFn,
 	}
@@ -79,10 +80,13 @@ func (t *Transport) sendLoop() {
 }
 
 // Deliver enqueues an incoming QUIC packet from the bridge for the local QUIC stack.
+// Makes a copy of data since the caller may reuse the buffer.
 func (t *Transport) Deliver(data []byte) {
+	buf := make([]byte, len(data))
+	copy(buf, data)
 	// Non-blocking: drop if buffer is full (QUIC handles retransmission).
 	select {
-	case t.readCh <- data:
+	case t.readCh <- buf:
 	default:
 	}
 }
@@ -116,9 +120,10 @@ func (t *Transport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 // WriteTo queues a QUIC packet for async sending through the bridge.
-// Returns immediately so QUIC's congestion controller is not blocked
-// by wsSend latency. If the send queue is full, the packet is dropped
-// (QUIC will retransmit).
+// Uses short-timeout backpressure instead of silent drops: waits up to 200ms
+// for queue space. This is critical because silent drops look like packet loss
+// to QUIC's congestion controller, causing cwnd collapse and severe throughput
+// degradation. Brief backpressure is much less harmful than artificial "loss".
 func (t *Transport) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	select {
 	case <-t.closeCh:
@@ -127,13 +132,28 @@ func (t *Transport) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	}
 	buf := make([]byte, len(p))
 	copy(buf, p)
+
+	// Try non-blocking first (fast path).
 	select {
 	case t.sendCh <- buf:
+		return len(p), nil
 	default:
-		// Send queue full — drop. QUIC retransmits.
-		log.Printf("[DEBUG] send queue full, dropping packet len=%d", len(buf))
 	}
-	return len(p), nil
+	// Queue full — apply brief backpressure rather than dropping.
+	// 200ms is long enough for workers to drain a few slots, short enough
+	// that QUIC won't declare a timeout.
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case t.sendCh <- buf:
+		return len(p), nil
+	case <-timer.C:
+		// Genuine overload — drop as last resort.
+		log.Printf("[WARN] send queue full after backpressure, dropping packet len=%d", len(buf))
+		return len(p), nil
+	case <-t.closeCh:
+		return 0, net.ErrClosed
+	}
 }
 
 // Close shuts down the transport.

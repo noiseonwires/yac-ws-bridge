@@ -275,6 +275,17 @@ func (u *Upstream) Run(ctx context.Context) {
 		u.mu.Unlock()
 		log.Println("[INFO] upstream connected")
 
+		// Send an immediate PING to force the cloud function to cross-notify
+		// the peer of our connId. Without this, discovery depends on the
+		// periodic PING (30s default) and the peer may time out waiting.
+		{
+			f := protocol.Encode(protocol.Frame{Type: protocol.MsgPing})
+			u.writeMu.Lock()
+			ws.WriteMessage(websocket.BinaryMessage, f)
+			u.writeMu.Unlock()
+			log.Println("[DEBUG] sent initial PING for fast discovery")
+		}
+
 		readCtx, readCancel := context.WithCancel(ctx)
 		captured := ws
 		go func() {

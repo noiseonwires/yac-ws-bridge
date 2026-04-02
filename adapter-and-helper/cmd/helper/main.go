@@ -72,6 +72,15 @@ func main() {
 		quicMu.Lock()
 		defer quicMu.Unlock()
 		if quicConn != nil {
+			// Check if connection is still alive.
+			select {
+			case <-quicConn.Context().Done():
+				log.Printf("[INFO] cached QUIC connection is dead, re-dialing")
+				quicConn = nil
+			default:
+			}
+		}
+		if quicConn != nil {
 			return quicConn, nil
 		}
 		log.Printf("[INFO] dialing QUIC to adapter (virtual transport)")
@@ -82,6 +91,15 @@ func main() {
 		quicConn = qc
 		log.Printf("[INFO] QUIC connection established")
 		return qc, nil
+	}
+
+	invalidateQUIC := func(dead quic.Connection) {
+		quicMu.Lock()
+		defer quicMu.Unlock()
+		if quicConn == dead {
+			log.Printf("[INFO] invalidating dead QUIC connection")
+			quicConn = nil
+		}
 	}
 
 	closeQUIC := func() {
@@ -165,7 +183,7 @@ func main() {
 				log.Printf("[WARN] accept error: %v", err)
 				continue
 			}
-			go handleConn(ctx, conn, ups, relay, getOrDialQUIC)
+			go handleConn(ctx, conn, ups, relay, getOrDialQUIC, invalidateQUIC)
 		}
 	}()
 
@@ -174,7 +192,7 @@ func main() {
 	ups.Run(ctx)
 }
 
-func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, relay bool, dialFn func(context.Context) (quic.Connection, error)) {
+func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, relay bool, dialFn func(context.Context) (quic.Connection, error), invalidateFn func(quic.Connection)) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
@@ -187,19 +205,27 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, rela
 		return
 	}
 
-	// Establish or reuse QUIC connection, open a stream.
-	qconn, err := dialFn(ctx)
-	if err != nil {
-		log.Printf("[WARN] QUIC dial failed: %v", err)
-		conn.Close()
-		return
-	}
-
-	qs, err := qconn.OpenStreamSync(ctx)
-	if err != nil {
-		log.Printf("[WARN] QUIC open stream failed: %v", err)
-		conn.Close()
-		return
+	// Try to open a QUIC stream; on failure invalidate the connection and retry once.
+	var qconn quic.Connection
+	var qs quic.Stream
+	for attempt := 0; attempt < 2; attempt++ {
+		var err error
+		qconn, err = dialFn(ctx)
+		if err != nil {
+			log.Printf("[WARN] QUIC dial failed: %v", err)
+			conn.Close()
+			return
+		}
+		qs, err = qconn.OpenStreamSync(ctx)
+		if err == nil {
+			break
+		}
+		log.Printf("[WARN] QUIC open stream failed (attempt %d): %v", attempt+1, err)
+		invalidateFn(qconn)
+		if attempt == 1 {
+			conn.Close()
+			return
+		}
 	}
 
 	log.Printf("[INFO] QUIC stream opened id=%d remote=%s", qs.StreamID(), conn.RemoteAddr())
@@ -220,8 +246,13 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	// Poll frequently, re-send SYNC every 2s in case the cloud function
+	// instance handling our first SYNC didn't know the adapter yet (serverless
+	// state is per-instance, a subsequent SYNC may hit a warmer instance).
+	pollTicker := time.NewTicker(200 * time.Millisecond)
+	defer pollTicker.Stop()
+	syncTicker := time.NewTicker(2 * time.Second)
+	defer syncTicker.Stop()
 
 	for {
 		select {
@@ -229,7 +260,12 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 			return false
 		case <-deadline.C:
 			return false
-		case <-ticker.C:
+		case <-syncTicker.C:
+			if ups.PeerConnID() == "" {
+				log.Printf("[DEBUG] re-sending SYNC for discovery")
+				ups.SendSync()
+			}
+		case <-pollTicker.C:
 			if ups.PeerConnID() != "" {
 				return true
 			}
