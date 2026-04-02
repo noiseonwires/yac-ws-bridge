@@ -27,6 +27,7 @@ function msgName(type) { return MSG_NAMES[type] || '0x' + type.toString(16); }
 let adapterConnId = null;
 let helperConnId = null;
 let _initPromise = null;
+let _lastFetchMs = 0; // timestamp of last fetchConnIds call
 
 // --- Protocol constants ---
 const MSG_HELLO     = 0x01;
@@ -86,6 +87,18 @@ async function fetchConnIds() {
 }
 
 _initPromise = fetchConnIds();
+
+// Try to learn the missing peer's connId via the adapter HTTP endpoint.
+// Skips if called within the last 2 seconds to avoid hammering.
+async function ensurePeerKnown(which) {
+  const now = Date.now();
+  if (now - _lastFetchMs < 2000) return;
+  if (which === 'adapter' && adapterConnId) return;
+  if (which === 'helper' && helperConnId) return;
+  console.log(`ensurePeerKnown: ${which} unknown, calling fetchConnIds`);
+  _lastFetchMs = now;
+  await fetchConnIds();
+}
 
 // WS management API — send binary data to a connection.
 async function wsSend(connId, data, token) {
@@ -219,6 +232,7 @@ async function handle(event, context) {
           console.error(`adapter HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
+        if (!helperConnId) await ensurePeerKnown('helper');
         if (helperConnId) {
           console.log(`adapter HELLO: notifying helper ${helperConnId} of adapter connId`);
           const st = await wsSend(helperConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
@@ -236,6 +250,7 @@ async function handle(event, context) {
           console.log(`adapter PING: re-learned adapterConnId=${connId} (was ${adapterConnId || 'null'})`);
           adapterConnId = connId;
         }
+        if (!helperConnId) await ensurePeerKnown('helper');
         // If we now know both sides, notify helper of adapter (covers cross-instance state loss)
         if (helperConnId) {
           console.log(`adapter PING: cross-notifying helper ${helperConnId} of adapter connId`);
@@ -249,6 +264,7 @@ async function handle(event, context) {
         return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
+        if (!helperConnId) await ensurePeerKnown('helper');
         if (helperConnId) {
           console.log(`adapter SYNC -> PEER_CONN helperConnId=${helperConnId}`);
           return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)));
@@ -292,6 +308,7 @@ async function handle(event, context) {
 
       // Stream frames (type >= 0x10): relay to adapter
       if (type >= 0x10) {
+        if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
           console.log(`relay ${msgName(type)} streamId=${streamId} seq=${seqId} -> adapter ${adapterConnId} bytes=${buf.length}`);
           const st = await wsSend(adapterConnId, buf, token);
@@ -321,6 +338,7 @@ async function handle(event, context) {
           console.error(`helper HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
+        if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
           console.log(`helper HELLO: notifying adapter ${adapterConnId} of helper connId`);
           const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
@@ -338,6 +356,7 @@ async function handle(event, context) {
           console.log(`helper PING: re-learned helperConnId=${connId} (was ${helperConnId || 'null'})`);
           helperConnId = connId;
         }
+        if (!adapterConnId) await ensurePeerKnown('adapter');
         // If we now know both sides, notify adapter of helper (covers cross-instance state loss)
         if (adapterConnId) {
           console.log(`helper PING: cross-notifying adapter ${adapterConnId} of helper connId`);
@@ -351,6 +370,7 @@ async function handle(event, context) {
         return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
+        if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
           console.log(`helper SYNC -> PEER_CONN adapterConnId=${adapterConnId}`);
           return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)));

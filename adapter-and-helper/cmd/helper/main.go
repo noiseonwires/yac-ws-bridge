@@ -269,8 +269,13 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	// Poll frequently, re-send SYNC every 2s in case the cloud function
+	// instance handling our first SYNC didn't know the adapter yet (serverless
+	// state is per-instance, a subsequent SYNC may hit a warmer instance).
+	pollTicker := time.NewTicker(200 * time.Millisecond)
+	defer pollTicker.Stop()
+	syncTicker := time.NewTicker(2 * time.Second)
+	defer syncTicker.Stop()
 
 	for {
 		select {
@@ -278,7 +283,12 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 			return false
 		case <-deadline.C:
 			return false
-		case <-ticker.C:
+		case <-syncTicker.C:
+			if ups.PeerConnID() == "" {
+				log.Printf("[DEBUG] re-sending SYNC for discovery")
+				ups.SendSync()
+			}
+		case <-pollTicker.C:
 			if ups.PeerConnID() != "" {
 				return true
 			}
