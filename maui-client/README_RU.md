@@ -8,7 +8,9 @@
 - **iOS** (15.0+)
 - **Windows** (10 1809+)
 - **macOS** (через Mac Catalyst, macOS 12+)
-- **Linux** — используйте Go-бинарник `helper` (`adapter/cmd/helper`)
+- **Linux** (через бэкенд GTK4)
+
+> **Про Linux:** Сборка под Linux в этом репозитории отдельно не настроена, но MAUI теперь официально поддерживает Linux через бэкенд GTK4. Следуйте инструкции Microsoft: <https://learn.microsoft.com/en-us/dotnet/maui/developer-tools/platform-backends/linux-gtk4?view=net-maui-10.0>. Как альтернатива, можно использовать Go-бинарник `helper` (`adapter-and-helper/cmd/helper`).
 
 ## Требования
 
