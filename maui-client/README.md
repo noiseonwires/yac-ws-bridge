@@ -2,6 +2,8 @@
 
 Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **helper** — listens on a local TCP port and tunnels connections to the adapter through YC.
 
+> **See also:** an alternative **IP-tunnel** build of this client lives on the [`ip-tun`](../../tree/ip-tun) branch. It uses an Android `VpnService` instead of a SOCKS-style local listener and supports **per-app tunneling**. Android-only; speed is roughly 2G-mobile, so it is bad for web browsing but works surprisingly well for Telegram.
+
 ## Supported platforms
 
 - **Android** (API 26+ / Android 8.0+)

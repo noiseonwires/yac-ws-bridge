@@ -6,13 +6,15 @@ A TCP and WebSocket tunnel via YC (using Serverless Functions and API Gateway, a
 
 See [README_RU.md](README_RU.md) for documentation in Russian.
 
-The tunnel comes in three variants:
+The tunnel comes in four variants:
 
 1. Single-adapter variant (branch `one-adapter`): proxies WebSocket connections (VLESS with WS transport or XMPP-over-WebSockets, for example). Does not require modifying clients or installing extra software on the client device — just point your WebSocket URL at the serverless function. Works slowly and very unstably. See README_RU.md in the `one-adapter` branch for details.
 
 2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster.
 
 3. Experimental variant (branch `experimental`), similar to variant 2 but instead of a custom multiplexing/error-correction algorithm it uses QUIC wrapped in WebSocket messages.
+
+4. IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter. **Android-only** (uses `VpnService`) but supports **per-app tunneling**, so you can route only the apps you want. Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but works surprisingly well for Telegram. See README/README_RU on the `ip-tun` branch for details.
 
 In the adapter + helper variant:
 
