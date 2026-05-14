@@ -1,102 +1,71 @@
-using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Sockets;
 using System.Net.WebSockets;
 
 namespace BridgeToFreedom.Services;
 
 /// <summary>
-/// Core tunnel service matching the Go helper logic.
-/// Manages upstream WS, TCP listener, stream multiplexing, and wsSend via YC gRPC API (or relay).
+/// Manages the upstream WebSocket to the YC API Gateway and exposes a packet
+/// I/O surface. Knows nothing about TUN devices: a platform-specific service
+/// (Android <c>BtfVpnService</c>) feeds it IP packets via <see cref="SendPacketAsync"/>
+/// and consumes inbound packets via <see cref="OnInboundPacket"/>.
 /// </summary>
 public sealed class TunnelService : IDisposable
 {
     public event Action<string>? OnLog;
     public event Action? OnStopped;
 
+    /// <summary>Raised on the upstream read thread when a peer-originated IP packet arrives.</summary>
+    public event Action<byte[]>? OnInboundPacket;
+
     private CancellationTokenSource? _cts;
     private volatile bool _stopping;
     private ClientWebSocket? _upstream;
-    private TcpListener? _listener;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-    // State
     private volatile bool _upstreamReady;
     private string _ownConnId = "";
     private string _peerConnId = "";
     private string _staleConnId = "";
     private string _iamToken = "";
-    private uint _nextStreamId;
 
-    private readonly ConcurrentDictionary<uint, StreamState> _streams = new();
-    private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pendingOpens = new();
-    private readonly ConcurrentDictionary<uint, uint> _streamSeqs = new();
+    // tx instrumentation: counted from the moment a packet enters SendToPeerAsync.
+    // Reported once per StatsIntervalMs by StatsLoopAsync.
+    private long _txOffered;
+    private long _txDroppedNotReady;
+    private long _txDroppedNoPeer;
+    private long _txDroppedNoToken;
+    private long _txSentRelay;
+    private long _txSentApi;
+    private long _txSendErr;
+    private long _rxPackets;
+    private long _rxBatchPackets;
+    private long _syncSentTicks; // last SYNC send tick (debounce)
+    private const int SyncDebounceMs = 500;
 
-    // Config
+    // --- Config ---
     public string BridgeUrl { get; set; } = "";
     public string AuthToken { get; set; } = "";
-    public string ListenAddress { get; set; } = "0.0.0.0";
-    public int ListenPort { get; set; } = 5080;
     public bool Relay { get; set; }
     public int PingIntervalMs { get; set; } = 30000;
-    public bool WriteCoalescing { get; set; }
-    public int WriteCoalescingDelayMs { get; set; } = 10;
+    public int StatsIntervalMs { get; set; } = 5000;
 
     public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
-
-    private sealed class StreamState : IDisposable
-    {
-        public uint Id;
-        public TcpClient Client;
-        public NetworkStream NetStream;
-        public CancellationTokenSource Cts;
-        public volatile bool Closed;
-
-        public StreamState(uint id, TcpClient client)
-        {
-            Id = id;
-            Client = client;
-            NetStream = client.GetStream();
-            Cts = new CancellationTokenSource();
-        }
-
-        public void Dispose()
-        {
-            if (Closed) return;
-            Closed = true;
-            Cts.Cancel();
-            try { NetStream.Dispose(); } catch { }
-            try { Client.Dispose(); } catch { }
-            Cts.Dispose();
-        }
-    }
+    public bool IsReady => _upstreamReady && (Relay || !string.IsNullOrEmpty(_peerConnId));
 
     public async Task StartAsync()
     {
-        if (_cts != null)
-        {
-            Log("StartAsync called but already running, ignoring.");
-            return;
-        }
+        if (_cts != null) { Log("StartAsync: already running"); return; }
         _cts = new CancellationTokenSource();
-        _nextStreamId = 1;
         _upstreamReady = false;
+        _stopping = false;
         var ct = _cts.Token;
 
         Log("Starting tunnel service...");
-        _stopping = false;
-
-        try
-        {
-            // Run upstream loop — it starts the listener after first successful connect
-            await UpstreamLoopAsync(ct);
-        }
+        try { await UpstreamLoopAsync(ct); }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Log($"Service error: {ex.Message}"); }
 
         _upstreamReady = false;
-        CloseAllStreams();
-        StopListener();
         Log("Tunnel service stopped.");
         OnStopped?.Invoke();
     }
@@ -110,7 +79,24 @@ public sealed class TunnelService : IDisposable
         try { cts?.Cancel(); } catch { }
     }
 
-    // --- Upstream WebSocket loop ---
+    /// <summary>
+    /// Sends one IP packet to the peer. Drops silently when the peer is not
+    /// known (TCP retransmission will recover).
+    /// </summary>
+    public Task SendPacketAsync(byte[] packet, CancellationToken ct = default)
+        => SendToPeerAsync(Protocol.Encode(Protocol.MsgPacket, packet), ct);
+
+    /// <summary>
+    /// Sends a batch of IP packets in a single PACKET_BATCH frame.
+    /// </summary>
+    public Task SendPacketBatchAsync(IReadOnlyList<byte[]> packets, CancellationToken ct = default)
+    {
+        if (packets.Count == 0) return Task.CompletedTask;
+        if (packets.Count == 1) return SendPacketAsync(packets[0], ct);
+        return SendToPeerAsync(Protocol.Encode(Protocol.MsgPacketBatch, Protocol.EncodePacketBatch(packets)), ct);
+    }
+
+    // --- Upstream ---
 
     private async Task UpstreamLoopAsync(CancellationToken ct)
     {
@@ -122,14 +108,9 @@ public sealed class TunnelService : IDisposable
                 Log($"Connecting to {BridgeUrl}...");
                 var bridgeUri = new Uri(BridgeUrl);
                 IPAddress[] addresses = Array.Empty<IPAddress>();
-                try
-                {
-                    addresses = await Dns.GetHostAddressesAsync(bridgeUri.Host);
-                }
-                catch (Exception ex)
-                {
-                    Log($"DNS resolve failed for {bridgeUri.Host}: {ex.Message}");
-                }
+                try { addresses = await Dns.GetHostAddressesAsync(bridgeUri.Host); }
+                catch (Exception ex) { Log($"DNS resolve failed for {bridgeUri.Host}: {ex.Message}"); }
+
                 var ws = new ClientWebSocket();
                 ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
                 _upstream = ws;
@@ -139,14 +120,12 @@ public sealed class TunnelService : IDisposable
                 await ws.ConnectAsync(bridgeUri, connCts.Token);
 
                 Log("WebSocket connected, sending HELLO...");
-                var hello = Protocol.Encode(Protocol.MsgHello, 0, Protocol.EncodeHello(0x01, AuthToken));
-                await WsSendUpstream(hello, ct);
+                await WsSendUpstream(Protocol.Encode(Protocol.MsgHello, Protocol.EncodeHello(0x01, AuthToken)), ct);
 
-                Log("HELLO sent, waiting for HELLO_OK...");
                 var resp = await WsReceiveWithTimeout(TimeSpan.FromSeconds(10), ct);
                 if (resp == null) { Log("No HELLO response, retrying..."); continue; }
 
-                var (type, _, _, payload) = Protocol.Decode(resp);
+                var (type, payload) = Protocol.Decode(resp);
                 if (type == Protocol.MsgHelloErr)
                 {
                     Log($"Auth rejected: {System.Text.Encoding.UTF8.GetString(payload)}");
@@ -167,6 +146,12 @@ public sealed class TunnelService : IDisposable
                 delay = 1000;
 
                 Log($"Authenticated. ownId={Shorten(ownId)} peerId={Shorten(peerId)}");
+                if (string.IsNullOrEmpty(peerId) && !Relay)
+                {
+                    Log("Peer unknown after HELLO_OK; sending SYNC");
+                    try { await WsSendUpstream(Protocol.Encode(Protocol.MsgSync), ct); } catch { }
+                    _syncSentTicks = Environment.TickCount;
+                }
                 LogDns("Gateway", bridgeUri.Host, addresses);
                 if (!Relay)
                 {
@@ -176,39 +161,32 @@ public sealed class TunnelService : IDisposable
                         var cloudIps = await Dns.GetHostAddressesAsync(cloudApiHost);
                         LogDns("Cloud API", cloudApiHost, cloudIps);
                     }
-                    catch (Exception ex)
-                    {
-                        Log($"Cloud API DNS resolve failed: {ex.Message}");
-                    }
+                    catch (Exception ex) { Log($"Cloud API DNS resolve failed: {ex.Message}"); }
                 }
                 else
                 {
-                    Log("Relay mode: Cloud API will NOT be used, all data goes through upstream WS");
+                    Log("Relay mode: Cloud API will NOT be used");
                 }
                 _upstreamReady = true;
 
-                // Start listener if not already running
-                EnsureListenerRunning(ct);
-
-                // Start ping loop and read loop
                 using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 var pingTask = PingLoopAsync(pingCts.Token);
+                var statsTask = StatsLoopAsync(pingCts.Token);
                 await ReadLoopAsync(ct);
                 pingCts.Cancel();
                 try { await pingTask; } catch { }
+                try { await statsTask; } catch { }
                 _upstreamReady = false;
                 Log("Upstream disconnected.");
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch (Exception ex) { Log($"Upstream error: {ex.Message}"); }
 
-            // Clean up
             _upstreamReady = false;
             CloseUpstream();
             _ownConnId = "";
             _peerConnId = "";
             _iamToken = "";
-            CloseAllStreams();
 
             if (ct.IsCancellationRequested) return;
             Log($"Reconnecting in {delay}ms...");
@@ -219,12 +197,12 @@ public sealed class TunnelService : IDisposable
 
     private async Task ReadLoopAsync(CancellationToken ct)
     {
-        var buffer = new byte[128 * 1024];
+        // 256 KiB upper bound: a single PACKET_BATCH may carry ~80 MTUs.
+        var buffer = new byte[256 * 1024];
         while (!ct.IsCancellationRequested && _upstream?.State == WebSocketState.Open)
         {
             try
             {
-                // Read full message (may arrive in multiple frames)
                 int totalRead = 0;
                 WebSocketReceiveResult result;
                 do
@@ -256,8 +234,7 @@ public sealed class TunnelService : IDisposable
     {
         try
         {
-            var (type, streamId, _, payload) = Protocol.Decode(data);
-
+            var (type, payload) = Protocol.Decode(data);
             switch (type)
             {
                 case Protocol.MsgPeerConn:
@@ -268,18 +245,16 @@ public sealed class TunnelService : IDisposable
                         return;
                     }
                     _staleConnId = "";
-                    // Cancel pending opens from previous peer session
-                    CancelPendingOpens("new peer connected");
+                    var prevPeer = _peerConnId;
                     _peerConnId = peerId;
                     if (iamToken != "") _iamToken = iamToken;
-                    Log($"Peer connected: {Shorten(peerId)}");
+                    if (prevPeer != peerId)
+                        Log($"Peer connected: {Shorten(peerId)}");
                     break;
 
                 case Protocol.MsgPeerGone:
-                    Log($"Peer gone, closing {_streams.Count} streams");
+                    Log("Peer gone");
                     _peerConnId = "";
-                    CancelPendingOpens("peer gone");
-                    CloseAllStreams();
                     break;
 
                 case Protocol.MsgPong:
@@ -287,366 +262,94 @@ public sealed class TunnelService : IDisposable
                     if (token != "") _iamToken = token;
                     break;
 
-                case Protocol.MsgOpenOK:
-                case Protocol.MsgOpenFail:
-                    if (_pendingOpens.TryRemove(streamId, out var tcs))
-                        tcs.TrySetResult(data);
-                    else
-                        Log($"{Protocol.MsgName(type)} for unknown stream={streamId}");
+                case Protocol.MsgPacket:
+                    Interlocked.Increment(ref _rxPackets);
+                    OnInboundPacket?.Invoke(payload);
                     break;
 
-                case Protocol.MsgData:
-                    if (_streams.TryGetValue(streamId, out var s) && !s.Closed)
+                case Protocol.MsgPacketBatch:
+                    Protocol.DecodePacketBatch(payload, seg =>
                     {
-                        try { s.NetStream.Write(payload, 0, payload.Length); }
-                        catch { CloseStream(s); }
-                    }
+                        Interlocked.Increment(ref _rxBatchPackets);
+                        var copy = new byte[seg.Count];
+                        Buffer.BlockCopy(seg.Array!, seg.Offset, copy, 0, seg.Count);
+                        OnInboundPacket?.Invoke(copy);
+                    });
                     break;
 
-                case Protocol.MsgFin:
-                    Log($"FIN stream={streamId}");
-                    if (_streams.TryGetValue(streamId, out var fs))
-                        CloseStream(fs);
-                    break;
-
-                case Protocol.MsgRst:
-                    Log($"RST stream={streamId}");
-                    if (_streams.TryGetValue(streamId, out var rs))
-                        CloseStream(rs);
+                default:
+                    Log($"Unknown frame type {Protocol.MsgName(type)}");
                     break;
             }
         }
         catch (Exception ex) { Log($"Frame error: {ex.Message}"); }
     }
 
-    // --- TCP Listener ---
-
-    private Task? _listenerTask;
-
-    private void EnsureListenerRunning(CancellationToken ct)
-    {
-        if (_listenerTask != null && !_listenerTask.IsCompleted) return;
-        StopListener();
-        Log("Starting TCP listener...");
-        _listenerTask = Task.Run(() => ListenerLoopAsync(ct), ct);
-    }
-
-    private void StopListener()
-    {
-        try { _listener?.Stop(); } catch { }
-        _listener = null;
-    }
-
-    private async Task ListenerLoopAsync(CancellationToken ct)
-    {
-        var ip = IPAddress.Parse(ListenAddress);
-        _listener = new TcpListener(ip, ListenPort);
-        _listener.Start();
-        Log($"Listening on {ListenAddress}:{ListenPort}");
-
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                TcpClient client;
-                try
-                {
-                    client = await _listener.AcceptTcpClientAsync(ct);
-                }
-                catch (OperationCanceledException) { break; }
-                catch (SocketException) when (ct.IsCancellationRequested) { break; }
-                catch (ObjectDisposedException) { break; }
-                catch (Exception ex)
-                {
-                    if (ct.IsCancellationRequested) break;
-                    Log($"Accept error: {ex.Message}");
-                    await Task.Delay(500, ct);
-                    continue;
-                }
-                client.NoDelay = true;
-                _ = Task.Run(() => HandleClientAsync(client, ct), ct);
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (SocketException) when (ct.IsCancellationRequested) { }
-        catch (Exception ex) { Log($"Listener error: {ex.Message}"); }
-        finally
-        {
-            try { _listener.Stop(); } catch { }
-            Log("Listener stopped.");
-        }
-    }
-
-    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
-    {
-        var sid = Interlocked.Increment(ref _nextStreamId) - 1;
-        var remote = client.Client.RemoteEndPoint?.ToString() ?? "?";
-        Log($"New connection remote={remote} stream={sid}");
-
-        var state = new StreamState(sid, client);
-        var tcs = new TaskCompletionSource<byte[]>();
-        _pendingOpens[sid] = tcs;
-
-        try
-        {
-            // Wait until upstream is connected and peer is known (up to 10s)
-            if (!await WaitForReadyAsync(ct))
-            {
-                Log($"OPEN failed stream={sid}: not ready (no upstream or peer)");
-                client.Dispose();
-                return;
-            }
-
-            // Send OPEN
-            var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid, NextSeq(sid)));
-            if (err != null) { Log($"OPEN failed stream={sid}: {err}"); client.Dispose(); return; }
-
-            // Wait for OPEN_OK/OPEN_FAIL
-            using var openCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            openCts.CancelAfter(TimeSpan.FromSeconds(10));
-            byte[] resp;
-            try { resp = await tcs.Task.WaitAsync(openCts.Token); }
-            catch (OperationCanceledException) { Log($"OPEN timeout stream={sid}"); client.Dispose(); return; }
-            finally { _pendingOpens.TryRemove(sid, out _); }
-
-            var (type, _, _, payload) = Protocol.Decode(resp);
-            if (type == Protocol.MsgOpenFail)
-            {
-                Log($"OPEN rejected stream={sid}");
-                client.Dispose();
-                return;
-            }
-
-            // Stream open — register and start forwarding
-            _streams[sid] = state;
-            Log($"Stream opened stream={sid} remote={remote}");
-
-            await TcpReadLoopAsync(state, ct);
-        }
-        catch (Exception ex) { Log($"Stream {sid} error: {ex.Message}"); }
-        finally
-        {
-            if (!state.Closed)
-            {
-                // Send FIN
-                _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgFin, sid, NextSeq(sid)));
-            }
-            CloseStream(state);
-        }
-    }
-
-    private async Task TcpReadLoopAsync(StreamState state, CancellationToken ct)
-    {
-        var buf = new byte[32 * 1024];
-        byte[]? coalesceBuf = null;
-        var coalesce = WriteCoalescing && WriteCoalescingDelayMs > 0;
-
-        async Task FlushCoalesce()
-        {
-            if (coalesceBuf == null || coalesceBuf.Length == 0) return;
-            var data = coalesceBuf;
-            coalesceBuf = null;
-            var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, NextSeq(state.Id), data));
-            if (err != null) Log($"Send DATA failed stream={state.Id}: {err}");
-        }
-
-        try
-        {
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cts.Token);
-            while (!linked.IsCancellationRequested)
-            {
-                int n;
-                if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
-                {
-                    // We have buffered data. Check if more is already waiting.
-                    if (state.NetStream.DataAvailable)
-                    {
-                        // Data in kernel buffer — read immediately without blocking
-                        n = state.NetStream.Read(buf, 0, buf.Length);
-                    }
-                    else
-                    {
-                        // Nothing waiting — give it coalescingMs for more data to arrive
-                        await Task.Delay(WriteCoalescingDelayMs, linked.Token);
-                        if (state.NetStream.DataAvailable)
-                        {
-                            n = state.NetStream.Read(buf, 0, buf.Length);
-                        }
-                        else
-                        {
-                            // Still nothing — flush what we have and block for next read
-                            await FlushCoalesce();
-                            continue;
-                        }
-                    }
-                }
-                else
-                {
-                    // No buffered data (or coalescing off) — block until data arrives
-                    n = await state.NetStream.ReadAsync(buf, 0, buf.Length, linked.Token);
-                }
-
-                if (n == 0) break; // EOF
-
-                if (coalesce)
-                {
-                    // Append to coalesce buffer
-                    if (coalesceBuf == null)
-                    {
-                        coalesceBuf = new byte[n];
-                        Buffer.BlockCopy(buf, 0, coalesceBuf, 0, n);
-                    }
-                    else
-                    {
-                        var newBuf = new byte[coalesceBuf.Length + n];
-                        Buffer.BlockCopy(coalesceBuf, 0, newBuf, 0, coalesceBuf.Length);
-                        Buffer.BlockCopy(buf, 0, newBuf, coalesceBuf.Length, n);
-                        coalesceBuf = newBuf;
-                    }
-                    // Flush immediately if buffer is large enough
-                    if (coalesceBuf.Length >= 32 * 1024)
-                        await FlushCoalesce();
-                }
-                else
-                {
-                    var payload = new byte[n];
-                    Buffer.BlockCopy(buf, 0, payload, 0, n);
-                    var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, NextSeq(state.Id), payload));
-                    if (err != null) { Log($"Send DATA failed stream={state.Id}: {err}"); return; }
-                }
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (IOException) { } // connection closed
-        catch (Exception ex) { Log($"TCP read stream={state.Id}: {ex.Message}"); }
-        finally
-        {
-            // Flush any remaining buffered data
-            if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
-            {
-                try { await FlushCoalesce(); } catch { }
-            }
-        }
-    }
-
-    // --- Readiness ---
-
-    /// <summary>
-    /// Waits until the upstream WS is connected and (in direct mode) peer ID is known.
-    /// Returns false if timed out or cancelled.
-    /// </summary>
-    private async Task<bool> WaitForReadyAsync(CancellationToken ct)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(10));
-
-        // Send SYNC to speed up peer discovery when upstream is connected but peer is unknown
-        if (_upstreamReady && !Relay && string.IsNullOrEmpty(_peerConnId))
-        {
-            try
-            {
-                Log("Peer unknown, sending SYNC for discovery");
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), ct);
-            }
-            catch { }
-        }
-
-        try
-        {
-            while (!timeout.IsCancellationRequested)
-            {
-                bool peerOk = Relay || !string.IsNullOrEmpty(_peerConnId);
-                if (_upstreamReady && peerOk) return true;
-                await Task.Delay(200, timeout.Token);
-            }
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
-        // Log diagnostics on failure
-        Log($"WaitForReady failed: upstreamReady={_upstreamReady} peerConnId={(_peerConnId != "" ? "set" : "empty")} relay={Relay}");
-        return false;
-    }
-
     // --- Send to peer ---
 
-    private async Task<string?> SendToPeerAsync(byte[] frame)
+    private async Task SendToPeerAsync(byte[] frame, CancellationToken ct)
     {
+        Interlocked.Increment(ref _txOffered);
         if (Relay)
         {
-            // Relay mode: send through upstream WS
-            if (!_upstreamReady)
-                return "upstream not connected (relay)";
-            try
-            {
-                await WsSendUpstream(frame, _cts?.Token ?? CancellationToken.None);
-                return null;
-            }
-            catch (Exception ex) { return ex.Message; }
+            if (!_upstreamReady) { Interlocked.Increment(ref _txDroppedNotReady); return; }
+            try { await WsSendUpstream(frame, ct); Interlocked.Increment(ref _txSentRelay); }
+            catch (Exception ex) { Interlocked.Increment(ref _txSendErr); Log($"Relay send failed: {ex.Message}"); }
+            return;
         }
 
-        // Direct mode: wsSend via YC REST API (gRPC not available from C#/MAUI easily)
         var peer = _peerConnId;
         var token = _iamToken;
-        if (string.IsNullOrEmpty(peer) || string.IsNullOrEmpty(token))
-            return "no peer connected";
-
-        try
+        if (string.IsNullOrEmpty(peer))
         {
-            await WsSendApi(peer, frame, token);
-            return null;
+            Interlocked.Increment(ref _txDroppedNoPeer);
+            // Debounced SYNC to ask cloud to re-announce peer connId.
+            var now = Environment.TickCount;
+            if (now - _syncSentTicks > SyncDebounceMs)
+            {
+                _syncSentTicks = now;
+                try { await WsSendUpstream(Protocol.Encode(Protocol.MsgSync), ct); } catch { }
+            }
+            return;
         }
+        if (string.IsNullOrEmpty(token)) { Interlocked.Increment(ref _txDroppedNoToken); return; }
+
+        try { await WsSendApi(peer, frame, token, ct); Interlocked.Increment(ref _txSentApi); }
         catch (Exception ex)
         {
-            // Mark stale and SYNC
+            Interlocked.Increment(ref _txSendErr);
             _staleConnId = _peerConnId;
             _peerConnId = "";
             Log($"wsSend failed: {ex.GetType().Name}: {ex.Message} (peer={peer}), marked stale, sending SYNC");
-            try
-            {
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), _cts?.Token ?? CancellationToken.None);
-            }
-            catch { }
-            return ex.Message;
+            try { await WsSendUpstream(Protocol.Encode(Protocol.MsgSync), ct); } catch { }
         }
     }
-
-    // --- YC WebSocket management API (REST) ---
 
     private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    private async Task WsSendApi(string connId, byte[] data, string iamToken)
+    private async Task WsSendApi(string connId, byte[] data, string iamToken, CancellationToken ct)
     {
-        if (Relay)
-            throw new InvalidOperationException("BUG: WsSendApi called in relay mode");
-
         var b64 = Convert.ToBase64String(data);
         var json = $"{{\"data\":\"{b64}\",\"type\":\"BINARY\"}}";
         var url = $"https://apigateway-connections.api.cloud.yandex.net/apigateways/websocket/v1/connections/{Uri.EscapeDataString(connId)}:send";
-
         using var req = new HttpRequestMessage(HttpMethod.Post, url);
         req.Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
         req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", iamToken);
-
-        var resp = await _http.SendAsync(req);
+        var resp = await _http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)
         {
-            var body = await resp.Content.ReadAsStringAsync();
+            var body = await resp.Content.ReadAsStringAsync(ct);
             throw new Exception($"wsSend {(int)resp.StatusCode}: {body}");
         }
     }
-
-    // --- Upstream WS helpers ---
 
     private async Task WsSendUpstream(byte[] data, CancellationToken ct)
     {
         var ws = _upstream;
         if (ws == null || ws.State != WebSocketState.Open)
             throw new InvalidOperationException("upstream not connected");
-
         await _writeLock.WaitAsync(ct);
-        try
-        {
-            await ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, ct);
-        }
+        try { await ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, ct); }
         finally { _writeLock.Release(); }
     }
 
@@ -654,11 +357,9 @@ public sealed class TunnelService : IDisposable
     {
         var ws = _upstream;
         if (ws == null) return null;
-
         using var toCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         toCts.CancelAfter(timeout);
-
-        var buffer = new byte[128 * 1024];
+        var buffer = new byte[64 * 1024];
         try
         {
             int totalRead = 0;
@@ -670,15 +371,11 @@ public sealed class TunnelService : IDisposable
                 if (result.MessageType == WebSocketMessageType.Close) return null;
                 totalRead += result.Count;
             } while (!result.EndOfMessage);
-
             var data = new byte[totalRead];
             Buffer.BlockCopy(buffer, 0, data, 0, totalRead);
             return data;
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            return null; // timeout
-        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return null; }
     }
 
     private async Task PingLoopAsync(CancellationToken ct)
@@ -688,43 +385,35 @@ public sealed class TunnelService : IDisposable
             while (!ct.IsCancellationRequested && _upstream?.State == WebSocketState.Open)
             {
                 await Task.Delay(PingIntervalMs, ct);
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgPing, 0), ct);
+                await WsSendUpstream(Protocol.Encode(Protocol.MsgPing), ct);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Log($"Ping error: {ex.Message}"); }
     }
 
-    // --- Helpers ---
-
-    private void CloseStream(StreamState state)
+    private async Task StatsLoopAsync(CancellationToken ct)
     {
-        if (_streams.TryRemove(state.Id, out _))
+        Log($"Stats loop starting (interval={StatsIntervalMs}ms)");
+        try
         {
-            _streamSeqs.TryRemove(state.Id, out _);
-            state.Dispose();
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(StatsIntervalMs, ct);
+                var off  = Interlocked.Read(ref _txOffered);
+                var dnr  = Interlocked.Read(ref _txDroppedNotReady);
+                var dnp  = Interlocked.Read(ref _txDroppedNoPeer);
+                var dnt  = Interlocked.Read(ref _txDroppedNoToken);
+                var sR   = Interlocked.Read(ref _txSentRelay);
+                var sA   = Interlocked.Read(ref _txSentApi);
+                var serr = Interlocked.Read(ref _txSendErr);
+                var rxP  = Interlocked.Read(ref _rxPackets);
+                var rxB  = Interlocked.Read(ref _rxBatchPackets);
+                Log($"stats tx[off={off} sentApi={sA} sentRelay={sR} err={serr} drop(notReady={dnr},noPeer={dnp},noToken={dnt})] rx[pkt={rxP} batchPkt={rxB}] state[ready={_upstreamReady} peer={Shorten(_peerConnId)} tokenLen={_iamToken.Length}]");
+            }
         }
-    }
-
-    private void CancelPendingOpens(string reason)
-    {
-        var count = _pendingOpens.Count;
-        foreach (var kvp in _pendingOpens)
-            kvp.Value.TrySetCanceled();
-        _pendingOpens.Clear();
-        if (count > 0)
-            Log($"Cancelled {count} pending opens: {reason}");
-    }
-
-    private void CloseAllStreams()
-    {
-        foreach (var kvp in _streams)
-        {
-            kvp.Value.Dispose();
-        }
-        _streams.Clear();
-        _streamSeqs.Clear();
-        CancelPendingOpens("close all");
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Log($"Stats error: {ex.Message}"); }
     }
 
     private void CloseUpstream()
@@ -746,6 +435,10 @@ public sealed class TunnelService : IDisposable
         System.Diagnostics.Debug.WriteLine(line);
     }
 
+    /// <summary>External callers (platform VPN service) can route log lines through
+    /// the same sink so they appear in the in-app log and logcat together.</summary>
+    public void LogExternal(string msg) => Log(msg);
+
     private void LogDns(string label, string host, IPAddress[] addresses)
     {
         var v4 = addresses.Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToArray();
@@ -759,15 +452,9 @@ public sealed class TunnelService : IDisposable
     private static string Shorten(string id) =>
         id.Length > 12 ? id[..8] + "..." + id[^4..] : id;
 
-    private uint NextSeq(uint streamId) =>
-        _streamSeqs.AddOrUpdate(streamId, 1, (_, old) => old + 1);
-
     public void Dispose()
     {
         Stop();
-        CloseAllStreams();
         CloseUpstream();
-        // Do NOT dispose _writeLock — it's reused across start/stop cycles
-        // and background threads may still reference it.
     }
 }

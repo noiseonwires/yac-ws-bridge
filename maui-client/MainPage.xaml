@@ -15,7 +15,7 @@
             <VerticalStackLayout Spacing="12">
 
                 <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
-                    <Label Text="Connection Settings" FontSize="18" FontAttributes="Bold" VerticalOptions="Center" />
+                    <Label Text="VPN Settings" FontSize="18" FontAttributes="Bold" VerticalOptions="Center" />
                     <Button Grid.Column="1" Text="Import" FontSize="12" Padding="12,4"
                             HeightRequest="32"
                             Clicked="OnImportClicked"
@@ -49,20 +49,28 @@
                            IsEnabled="{Binding IsNotRunning}" />
                 </VerticalStackLayout>
 
-                <!-- Listen Address + Port -->
-                <Grid ColumnDefinitions="2*,*" ColumnSpacing="8">
+                <!-- Tunnel addresses -->
+                <Grid ColumnDefinitions="*,*,Auto" ColumnSpacing="8">
                     <VerticalStackLayout Spacing="4">
-                        <Label Text="Listen Address" FontSize="12"
+                        <Label Text="Local tunnel IP" FontSize="12"
                                TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
-                        <Entry x:Name="ListenAddressEntry"
-                               Text="127.0.0.1"
+                        <Entry x:Name="TunnelAddressEntry"
+                               Text="10.200.0.2"
                                IsEnabled="{Binding IsNotRunning}" />
                     </VerticalStackLayout>
                     <VerticalStackLayout Grid.Column="1" Spacing="4">
-                        <Label Text="Port" FontSize="12"
+                        <Label Text="Peer tunnel IP" FontSize="12"
                                TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
-                        <Entry x:Name="ListenPortEntry"
-                               Text="1080"
+                        <Entry x:Name="PeerAddressEntry"
+                               Text="10.200.0.1"
+                               IsEnabled="{Binding IsNotRunning}" />
+                    </VerticalStackLayout>
+                    <VerticalStackLayout Grid.Column="2" Spacing="4">
+                        <Label Text="MTU" FontSize="12"
+                               TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                        <Entry x:Name="MtuEntry"
+                               Text="1400"
+                               WidthRequest="80"
                                Keyboard="Numeric"
                                IsEnabled="{Binding IsNotRunning}" />
                     </VerticalStackLayout>
@@ -76,13 +84,15 @@
                             IsEnabled="{Binding IsNotRunning}" />
                 </Grid>
 
-                <!-- Write coalescing toggle -->
-                <Grid ColumnDefinitions="*,Auto">
-                    <Label Text="Write coalescing (Nagle-like, 50ms)"
-                           VerticalOptions="Center" FontSize="13" />
-                    <Switch x:Name="CoalesceSwitch" Grid.Column="1"
-                            IsEnabled="{Binding IsNotRunning}" />
-                </Grid>
+                <!-- Per-app picker -->
+                <Button x:Name="SelectAppsButton"
+                        Text="Select apps for VPN…"
+                        FontSize="13"
+                        HeightRequest="40"
+                        Clicked="OnSelectAppsClicked"
+                        IsEnabled="{Binding IsNotRunning}"
+                        BackgroundColor="{AppThemeBinding Light=#E8E0F7, Dark=#3A3060}"
+                        TextColor="{AppThemeBinding Light=#512BD4, Dark=#C8B8F0}" />
 
                 <!-- Connect / Disconnect Button -->
                 <Button x:Name="ConnectButton"

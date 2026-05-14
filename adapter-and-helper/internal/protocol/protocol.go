@@ -5,7 +5,15 @@ import (
 	"errors"
 )
 
-// Message types — control (streamID = 0).
+// Wire format: [1B type][payload...]
+//
+// Both sides are symmetric: they read raw IP packets from a local TUN device,
+// wrap each one in a PACKET frame, ship it through the WebSocket bridge to the
+// peer, and the peer writes it to its own TUN. The OS TCP/IP stack on each end
+// handles fragmentation, reordering, retransmission, and congestion control —
+// this transport layer just shuttles opaque IP datagrams.
+
+// Control messages.
 const (
 	MsgHello    byte = 0x01
 	MsgHelloOK  byte = 0x02
@@ -17,46 +25,73 @@ const (
 	MsgPong     byte = 0xF1
 )
 
-// Message types — stream (streamID > 0).
+// Data messages.
 const (
-	MsgOpen     byte = 0x10
-	MsgOpenOK   byte = 0x11
-	MsgOpenFail byte = 0x12
-	MsgData     byte = 0x20
-	MsgFin      byte = 0x21
-	MsgRst      byte = 0x22
+	// MsgPacket payload = a single raw IP packet (IPv4 or IPv6).
+	MsgPacket byte = 0x10
+	// MsgPacketBatch payload = repeated [2B lenBE][rawIPpacket].
+	// Used by the optional write-coalescing path to reduce per-message overhead.
+	MsgPacketBatch byte = 0x11
 )
 
 // Frame is a single protocol message.
-// Wire: [1B type][4B streamID BE][4B seqID BE][payload...]
 type Frame struct {
-	Type     byte
-	StreamID uint32
-	SeqID    uint32
-	Payload  []byte
+	Type    byte
+	Payload []byte
 }
 
 // Encode serialises a Frame.
 func Encode(f Frame) []byte {
-	buf := make([]byte, 9+len(f.Payload))
+	buf := make([]byte, 1+len(f.Payload))
 	buf[0] = f.Type
-	binary.BigEndian.PutUint32(buf[1:5], f.StreamID)
-	binary.BigEndian.PutUint32(buf[5:9], f.SeqID)
-	copy(buf[9:], f.Payload)
+	copy(buf[1:], f.Payload)
 	return buf
 }
 
 // Decode parses a byte slice into a Frame.
 func Decode(data []byte) (Frame, error) {
-	if len(data) < 9 {
+	if len(data) < 1 {
 		return Frame{}, errors.New("frame too short")
 	}
-	return Frame{
-		Type:     data[0],
-		StreamID: binary.BigEndian.Uint32(data[1:5]),
-		SeqID:    binary.BigEndian.Uint32(data[5:9]),
-		Payload:  data[9:],
-	}, nil
+	return Frame{Type: data[0], Payload: data[1:]}, nil
+}
+
+// EncodePacketBatch builds a MsgPacketBatch payload from the given packets.
+func EncodePacketBatch(packets [][]byte) []byte {
+	total := 0
+	for _, p := range packets {
+		total += 2 + len(p)
+	}
+	buf := make([]byte, total)
+	off := 0
+	for _, p := range packets {
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(p)))
+		off += 2
+		copy(buf[off:], p)
+		off += len(p)
+	}
+	return buf
+}
+
+// DecodePacketBatch yields each packet to fn. Returns the number of packets
+// processed, or an error if the payload is malformed.
+func DecodePacketBatch(payload []byte, fn func(pkt []byte)) (int, error) {
+	off := 0
+	count := 0
+	for off < len(payload) {
+		if off+2 > len(payload) {
+			return count, errors.New("PACKET_BATCH: truncated length prefix")
+		}
+		l := int(binary.BigEndian.Uint16(payload[off:]))
+		off += 2
+		if off+l > len(payload) {
+			return count, errors.New("PACKET_BATCH: truncated packet")
+		}
+		fn(payload[off : off+l])
+		off += l
+		count++
+	}
+	return count, nil
 }
 
 // EncodeHello builds a HELLO payload: [1B version][token UTF-8].

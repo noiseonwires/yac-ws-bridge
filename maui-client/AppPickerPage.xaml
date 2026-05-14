@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+    x:Class="BridgeToFreedom.AppPickerPage"
+    Title="Apps to route through VPN">
+
+    <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" Padding="12" RowSpacing="8">
+
+        <Label Grid.Row="0"
+               Text="Only the selected apps will use the VPN. If nothing is selected, ALL apps will use it (the helper itself is always excluded)."
+               FontSize="12"
+               TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+
+        <SearchBar Grid.Row="1"
+                   x:Name="FilterBar"
+                   Placeholder="Filter by name or package…"
+                   TextChanged="OnFilterChanged" />
+
+        <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <Label x:Name="CountLabel"
+                   Text="0 selected"
+                   VerticalOptions="Center"
+                   FontSize="12" />
+            <Button Grid.Column="1" Text="Select all" FontSize="12"
+                    Padding="10,4" HeightRequest="32"
+                    Clicked="OnSelectAllClicked" />
+            <Button Grid.Column="2" Text="Clear" FontSize="12"
+                    Padding="10,4" HeightRequest="32"
+                    Clicked="OnClearClicked" />
+        </Grid>
+
+        <CollectionView Grid.Row="3"
+                        x:Name="AppsList"
+                        SelectionMode="None">
+            <CollectionView.ItemTemplate>
+                <DataTemplate>
+                    <Grid Padding="8,6" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10"
+                          BackgroundColor="Transparent">
+                        <Grid.GestureRecognizers>
+                            <TapGestureRecognizer Tapped="OnRowTapped" />
+                        </Grid.GestureRecognizers>
+
+                        <Image Source="{Binding IconSource}"
+                               WidthRequest="32" HeightRequest="32"
+                               VerticalOptions="Center" />
+
+                        <VerticalStackLayout Grid.Column="1" Spacing="2" VerticalOptions="Center">
+                            <Label Text="{Binding Label}" FontSize="14" />
+                            <Label Text="{Binding Package}" FontSize="11"
+                                   TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                        </VerticalStackLayout>
+
+                        <CheckBox Grid.Column="2"
+                                  IsChecked="{Binding IsChecked, Mode=TwoWay}"
+                                  CheckedChanged="OnRowCheckedChanged"
+                                  VerticalOptions="Center" />
+                    </Grid>
+                </DataTemplate>
+            </CollectionView.ItemTemplate>
+
+            <CollectionView.EmptyView>
+                <Label Text="Loading installed apps…"
+                       HorizontalOptions="Center"
+                       VerticalOptions="Center"
+                       FontSize="13"
+                       TextColor="Gray" />
+            </CollectionView.EmptyView>
+        </CollectionView>
+
+        <Grid Grid.Row="4" ColumnDefinitions="*,*" ColumnSpacing="8">
+            <Button Text="Cancel"
+                    Clicked="OnCancelClicked"
+                    BackgroundColor="{AppThemeBinding Light=#E0E0E0, Dark=#333333}"
+                    TextColor="{AppThemeBinding Light=Black, Dark=White}" />
+            <Button Grid.Column="1" Text="Save"
+                    Clicked="OnDoneClicked"
+                    BackgroundColor="#512BD4"
+                    TextColor="White" />
+        </Grid>
+    </Grid>
+</ContentPage>

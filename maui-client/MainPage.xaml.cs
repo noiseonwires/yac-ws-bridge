@@ -6,9 +6,12 @@ namespace BridgeToFreedom;
 
 public partial class MainPage : ContentPage
 {
+    private const string PrefAllowedPackages = "AllowedPackages";
+
     private readonly TunnelService _tunnel;
     private readonly StringBuilder _logBuffer = new();
     private bool _isRunning;
+    private HashSet<string> _allowedPackages = new(StringComparer.Ordinal);
 
     public bool IsNotRunning => !_isRunning;
 
@@ -19,15 +22,15 @@ public partial class MainPage : ContentPage
         _tunnel = tunnel;
         _tunnel.OnLog += OnTunnelLog;
 
-        // Load saved settings
-        BridgeUrlEntry.Text = Preferences.Default.Get("BridgeUrl", "wss://");
-        AuthTokenEntry.Text = Preferences.Default.Get("AuthToken", "");
-        ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "0.0.0.0");
-        ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "5080");
-        RelaySwitch.IsToggled = Preferences.Default.Get("Relay", false);
-        CoalesceSwitch.IsToggled = Preferences.Default.Get("WriteCoalescing", false);
+        BridgeUrlEntry.Text       = Preferences.Default.Get("BridgeUrl", "wss://");
+        AuthTokenEntry.Text       = Preferences.Default.Get("AuthToken", "");
+        TunnelAddressEntry.Text   = Preferences.Default.Get("TunnelAddress", "10.200.0.2");
+        PeerAddressEntry.Text     = Preferences.Default.Get("PeerAddress", "10.200.0.1");
+        MtuEntry.Text             = Preferences.Default.Get("Mtu", "1400");
+        RelaySwitch.IsToggled     = Preferences.Default.Get("Relay", false);
+        _allowedPackages          = LoadAllowedPackages();
+        UpdateSelectAppsButton();
 
-        // Restore UI state if tunnel is already running (e.g. after activity recreate from background)
         if (_tunnel.IsRunning)
         {
             _isRunning = true;
@@ -35,7 +38,7 @@ public partial class MainPage : ContentPage
             ConnectButton.BackgroundColor = Color.FromArgb("#D32F2F");
             OnPropertyChanged(nameof(IsNotRunning));
             _tunnel.OnStopped += OnTunnelStopped;
-            AddLog("[resumed — tunnel is running in background]");
+            AddLog("[resumed — VPN is running in background]");
         }
     }
 
@@ -50,22 +53,19 @@ public partial class MainPage : ContentPage
                 return;
             }
 
-            // btf://host/path?token=X&listen=addr:port&relay=1
             var bridgeUri = new Uri(url);
             var qs = HttpUtility.ParseQueryString("");
             qs["token"] = AuthTokenEntry.Text?.Trim() ?? "";
-            qs["listen"] = $"{ListenAddressEntry.Text?.Trim()}:{ListenPortEntry.Text?.Trim()}";
+            qs["addr"]  = TunnelAddressEntry.Text?.Trim() ?? "";
+            qs["peer"]  = PeerAddressEntry.Text?.Trim() ?? "";
+            qs["mtu"]   = MtuEntry.Text?.Trim() ?? "";
             if (RelaySwitch.IsToggled) qs["relay"] = "1";
-            if (CoalesceSwitch.IsToggled) qs["coalesce"] = "1";
 
             var btfUrl = $"btf://{bridgeUri.Host}{bridgeUri.AbsolutePath}?{qs}";
             await Clipboard.Default.SetTextAsync(btfUrl);
-            AddLog($"Config exported to clipboard");
+            AddLog("Config exported to clipboard");
         }
-        catch (Exception ex)
-        {
-            AddLog($"Export failed: {ex.Message}");
-        }
+        catch (Exception ex) { AddLog($"Export failed: {ex.Message}"); }
     }
 
     private async void OnImportClicked(object? sender, EventArgs e)
@@ -79,51 +79,36 @@ public partial class MainPage : ContentPage
                 return;
             }
 
-            // btf://host/path?token=X&listen=addr:port&relay=1  ->  wss://host/path
             var uri = new Uri(text);
             var qs = HttpUtility.ParseQueryString(uri.Query);
 
-            BridgeUrlEntry.Text = $"wss://{uri.Host}{uri.AbsolutePath}";
-            AuthTokenEntry.Text = qs["token"] ?? "";
-
-            var listen = qs["listen"] ?? "";
-            var colonIdx = listen.LastIndexOf(':');
-            if (colonIdx > 0)
-            {
-                ListenAddressEntry.Text = listen[..colonIdx];
-                ListenPortEntry.Text = listen[(colonIdx + 1)..];
-            }
-
-            RelaySwitch.IsToggled = qs["relay"] == "1";
-            CoalesceSwitch.IsToggled = qs["coalesce"] == "1";
+            BridgeUrlEntry.Text     = $"wss://{uri.Host}{uri.AbsolutePath}";
+            AuthTokenEntry.Text     = qs["token"] ?? "";
+            TunnelAddressEntry.Text = qs["addr"] ?? TunnelAddressEntry.Text;
+            PeerAddressEntry.Text   = qs["peer"] ?? PeerAddressEntry.Text;
+            MtuEntry.Text           = qs["mtu"]  ?? MtuEntry.Text;
+            RelaySwitch.IsToggled   = qs["relay"] == "1";
             AddLog("Config imported from clipboard");
         }
-        catch (Exception ex)
-        {
-            AddLog($"Import failed: {ex.Message}");
-        }
+        catch (Exception ex) { AddLog($"Import failed: {ex.Message}"); }
     }
 
     private async void OnConnectClicked(object? sender, EventArgs e)
     {
         if (_isRunning)
         {
-            // Stop — this triggers OnDestroy in the service which calls Tunnel.Stop()
             StopPlatformService();
             _tunnel.Stop();
-            _isRunning = false;
-            ConnectButton.Text = "CONNECT";
-            ConnectButton.BackgroundColor = Color.FromArgb("#512BD4");
-            OnPropertyChanged(nameof(IsNotRunning));
+            SetStoppedUi();
             AddLog("Stopped by user.");
             return;
         }
 
-        // Validate
         var url = BridgeUrlEntry.Text?.Trim();
         var token = AuthTokenEntry.Text?.Trim();
-        var addr = ListenAddressEntry.Text?.Trim();
-        var portStr = ListenPortEntry.Text?.Trim();
+        var addr = TunnelAddressEntry.Text?.Trim();
+        var peer = PeerAddressEntry.Text?.Trim();
+        var mtuStr = MtuEntry.Text?.Trim();
 
         if (string.IsNullOrEmpty(url) || !url.StartsWith("wss://"))
         {
@@ -135,26 +120,40 @@ public partial class MainPage : ContentPage
             await DisplayAlertAsync("Error", "Auth token is required", "OK");
             return;
         }
-        if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
+        if (string.IsNullOrEmpty(addr) || !System.Net.IPAddress.TryParse(addr, out _))
         {
-            await DisplayAlertAsync("Error", "Port must be 1-65535", "OK");
+            await DisplayAlertAsync("Error", "Local tunnel IP is invalid", "OK");
+            return;
+        }
+        if (string.IsNullOrEmpty(peer) || !System.Net.IPAddress.TryParse(peer, out _))
+        {
+            await DisplayAlertAsync("Error", "Peer tunnel IP is invalid", "OK");
+            return;
+        }
+        if (!int.TryParse(mtuStr, out var mtu) || mtu < 576 || mtu > 9000)
+        {
+            await DisplayAlertAsync("Error", "MTU must be 576-9000", "OK");
+            return;
+        }
+
+        // Ask for VPN permission before configuring anything
+        var granted = await MainActivity.RequestVpnPermissionAsync();
+        if (!granted)
+        {
+            await DisplayAlertAsync("Permission", "VPN permission was not granted.", "OK");
             return;
         }
 
         _tunnel.BridgeUrl = url;
         _tunnel.AuthToken = token;
-        _tunnel.ListenAddress = addr ?? "0.0.0.0";
-        _tunnel.ListenPort = port;
-        _tunnel.Relay = RelaySwitch.IsToggled;
-        _tunnel.WriteCoalescing = CoalesceSwitch.IsToggled;
+        _tunnel.Relay     = RelaySwitch.IsToggled;
 
-        // Save settings
         Preferences.Default.Set("BridgeUrl", url);
         Preferences.Default.Set("AuthToken", token);
-        Preferences.Default.Set("ListenAddress", addr ?? "0.0.0.0");
-        Preferences.Default.Set("ListenPort", portStr!);
+        Preferences.Default.Set("TunnelAddress", addr);
+        Preferences.Default.Set("PeerAddress", peer);
+        Preferences.Default.Set("Mtu", mtuStr!);
         Preferences.Default.Set("Relay", RelaySwitch.IsToggled);
-        Preferences.Default.Set("WriteCoalescing", CoalesceSwitch.IsToggled);
 
         _isRunning = true;
         ConnectButton.Text = "DISCONNECT";
@@ -164,74 +163,107 @@ public partial class MainPage : ContentPage
         _logBuffer.Clear();
         LogLabel.Text = "";
 
-        // Start: on Android the foreground service runs the tunnel;
-        // on other platforms we run it in a Task.
-        StartPlatformService();
-
+        StartPlatformService(addr, peer, mtu);
         _tunnel.OnStopped += OnTunnelStopped;
+    }
+
+    private void SetStoppedUi()
+    {
+        _isRunning = false;
+        ConnectButton.Text = "CONNECT";
+        ConnectButton.BackgroundColor = Color.FromArgb("#512BD4");
+        OnPropertyChanged(nameof(IsNotRunning));
     }
 
     private void OnTunnelStopped()
     {
         _tunnel.OnStopped -= OnTunnelStopped;
         StopPlatformService();
-        MainThread.BeginInvokeOnMainThread(() =>
-        {
-            _isRunning = false;
-            ConnectButton.Text = "CONNECT";
-            ConnectButton.BackgroundColor = Color.FromArgb("#512BD4");
-            OnPropertyChanged(nameof(IsNotRunning));
-        });
+        MainThread.BeginInvokeOnMainThread(SetStoppedUi);
     }
 
-    private void OnTunnelLog(string line)
-    {
-        MainThread.BeginInvokeOnMainThread(() => AddLog(line));
-    }
+    private void OnTunnelLog(string line) => MainThread.BeginInvokeOnMainThread(() => AddLog(line));
 
     private void AddLog(string line)
     {
         _logBuffer.AppendLine(line);
-        // Keep last 200 lines
         var lines = _logBuffer.ToString().Split('\n');
         if (lines.Length > 200)
         {
             _logBuffer.Clear();
-            foreach (var l in lines[^200..])
-                _logBuffer.AppendLine(l);
+            foreach (var l in lines[^200..]) _logBuffer.AppendLine(l);
         }
         LogLabel.Text = _logBuffer.ToString();
-        try { LogScrollView.ScrollToAsync(LogLabel, ScrollToPosition.End, false); }
-        catch { }
+        try { LogScrollView.ScrollToAsync(LogLabel, ScrollToPosition.End, false); } catch { }
     }
 
-    private void StartPlatformService()
+    private void StartPlatformService(string localAddr, string peerAddr, int mtu)
     {
-#if ANDROID
-        Platforms.Android.TunnelForegroundService.Tunnel = _tunnel;
-        var context = Android.App.Application.Context;
-        var intent = new Android.Content.Intent(context, typeof(Platforms.Android.TunnelForegroundService));
-        context.StartForegroundService(intent);
-#else
-        // iOS, macOS, Windows: run the tunnel in a background task.
-        // iOS stays alive via beginBackgroundTask + BGProcessingTask in AppDelegate.
-        _ = Task.Run(async () =>
+        Platforms.Android.BtfVpnService.Tunnel = _tunnel;
+        var context = global::Android.App.Application.Context;
+        var intent = new global::Android.Content.Intent(context, typeof(Platforms.Android.BtfVpnService));
+        intent.PutExtra(Platforms.Android.BtfVpnService.ExtraTunnelAddress, localAddr);
+        intent.PutExtra(Platforms.Android.BtfVpnService.ExtraPeerAddress, peerAddr);
+        intent.PutExtra(Platforms.Android.BtfVpnService.ExtraMtu, mtu);
+        if (_allowedPackages.Count > 0)
         {
-            try { await _tunnel.StartAsync(); }
-            catch (Exception ex) { AddLog($"Fatal: {ex.Message}"); }
-            finally { OnTunnelStopped(); }
-        });
-#endif
+            intent.PutExtra(Platforms.Android.BtfVpnService.ExtraAllowedPackages,
+                _allowedPackages.ToArray());
+        }
+        context.StartForegroundService(intent);
     }
 
     private static void StopPlatformService()
     {
-#if ANDROID
-        var context = Android.App.Application.Context;
-        var intent = new Android.Content.Intent(context, typeof(Platforms.Android.TunnelForegroundService));
-        context.StopService(intent);
-        Platforms.Android.TunnelForegroundService.Tunnel = null;
-#endif
-        // iOS/macOS/Windows: tunnel stops via _tunnel.Stop() called before this
+        var context = global::Android.App.Application.Context;
+        var intent = new global::Android.Content.Intent(context, typeof(Platforms.Android.BtfVpnService));
+        intent.SetAction(Platforms.Android.BtfVpnService.ActionStop);
+        context.StartService(intent);
+        Platforms.Android.BtfVpnService.Tunnel = null;
+    }
+
+    // -- Per-app picker --------------------------------------------------------
+
+    private async void OnSelectAppsClicked(object? sender, EventArgs e)
+    {
+        if (_isRunning)
+        {
+            await DisplayAlertAsync("Disconnect first",
+                "Stop the VPN before changing the app list.", "OK");
+            return;
+        }
+
+        var page = new AppPickerPage(_allowedPackages);
+        await Navigation.PushModalAsync(page);
+        var result = await page.Result;
+        if (result == null) return; // cancelled
+
+        _allowedPackages = result;
+        SaveAllowedPackages(_allowedPackages);
+        UpdateSelectAppsButton();
+        AddLog(_allowedPackages.Count == 0
+            ? "App selection cleared — VPN will route ALL apps."
+            : $"App selection saved: {_allowedPackages.Count} app(s) will use the VPN.");
+    }
+
+    private void UpdateSelectAppsButton()
+    {
+        SelectAppsButton.Text = _allowedPackages.Count == 0
+            ? "Select apps for VPN… (all apps)"
+            : $"Select apps for VPN… ({_allowedPackages.Count} selected)";
+    }
+
+    private static HashSet<string> LoadAllowedPackages()
+    {
+        var raw = Preferences.Default.Get(PrefAllowedPackages, "");
+        if (string.IsNullOrWhiteSpace(raw)) return new HashSet<string>(StringComparer.Ordinal);
+        return new HashSet<string>(
+            raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+            StringComparer.Ordinal);
+    }
+
+    private static void SaveAllowedPackages(HashSet<string> packages)
+    {
+        Preferences.Default.Set(PrefAllowedPackages, string.Join(',', packages));
     }
 }

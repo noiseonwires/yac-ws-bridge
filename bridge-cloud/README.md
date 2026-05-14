@@ -1,5 +1,9 @@
 # Bridge to Freedom — Yandex Cloud Deployment
 
+> ⚠️ **This deployment matches the `ip-tun` branch** of the repo. Check out that branch (`git checkout ip-tun`) before packaging and uploading `index.js` — the protocol on other branches is different and incompatible.
+
+> The on-device client is the **Android-only MAUI app** with **per-app tunneling** built in. In practice this tunnel is **not** usable for general web browsing (speed feels like an old 2G/EDGE connection) but is **surprisingly good for Telegram** — so the recommended deployment is: this Yandex Cloud setup + Android app + per-app tunneling enabled, routing only Telegram (and maybe one or two similar latency-tolerant low-bandwidth apps) through the tunnel.
+
 ## Architecture
 
 ```

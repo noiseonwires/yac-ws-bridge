@@ -1,63 +1,86 @@
-# Bridge to Freedom — Client app
+# Bridge to Freedom — Android client
 
-Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **helper** — listens on a local TCP port and tunnels connections to the adapter through YC.
+GUI client for the Bridge to Freedom IP tunnel. Acts as the **helper** end of the tunnel: opens a system VPN (`VpnService`) and ships raw IP packets through YC API Gateway to the adapter on the other side.
+
+> ⚠️ **This client lives on the `ip-tun` branch** of the repo. `git checkout ip-tun` before building. Other branches contain different (incompatible) versions of the helper.
+
+See [README_RU.md](README_RU.md) for documentation in Russian.
+
+## What it's good for (and what it isn't)
+
+This is a serverless WebSocket pretending to be a layer-3 tunnel. Real-world speed feels like an old 2G/EDGE mobile connection — perfectly **unsuitable** for general web browsing, streaming or large downloads.
+
+It is, however, **surprisingly good for Telegram**. The Telegram protocol is small-message, latency-tolerant and reconnect-friendly, which matches exactly what this tunnel can deliver. Chats, voice messages and small media work well.
+
+**Recommended setup**: enable **per-app tunneling** in the app and route **only Telegram** (optionally one or two similar low-bandwidth, latency-tolerant apps) through the VPN. Leave everything else on your normal connection — this gives you fast unrestricted browsing for normal apps and a working Telegram on top.
 
 ## Supported platforms
 
-- **Android** (API 26+ / Android 8.0+)
-- **iOS** (15.0+)
-- **Windows** (10 1809+)
-- **macOS** (via Mac Catalyst, macOS 12+)
-- **Linux** (via the GTK4 backend)
+- **Android only** (API 26+ / Android 8.0+) — with built-in **per-app tunneling**.
 
-> **Note on Linux:** A Linux build target is not set up in this repository, but MAUI now officially supports Linux through the GTK4 backend. Follow Microsoft's guide: <https://learn.microsoft.com/en-us/dotnet/maui/developer-tools/platform-backends/linux-gtk4?view=net-maui-10.0>. As an alternative, you can use the Go `helper` binary (`adapter-and-helper/cmd/helper`).
+The IP-tunnel design requires direct, unmediated access to a TUN device, which is not possible to add as pure managed-MAUI code on other platforms:
+
+- **iOS** needs a separate `NEPacketTunnelProvider` system extension target — out of scope for a single MAUI project.
+- **Windows** needs a `wintun.dll` native loader — use the Go [`helper`](../adapter-and-helper/cmd/helper) binary instead.
+- **macOS** needs a system extension with the Network Extension entitlement — same story, use the Go helper.
+
+If you need a desktop client, build the Go [`helper`](../adapter-and-helper) and follow the routing instructions in the root [README.md](../README.md#routing-on-the-client).
 
 ## Requirements
 
-- .NET 10 SDK
+- .NET 10 SDK (preview at the time of writing)
 - MAUI workload: `dotnet workload install maui`
-- For Android: Android SDK (installed automatically with the MAUI workload)
-- For iOS/macOS: a Mac with Xcode
+- Android SDK (installed automatically with the MAUI workload)
 
-## Important
+## Permissions
 
-If you use a proxy client that works as a TUN, you must add an exclusion for the helper process, otherwise you'll get an infinite loop and nothing will work. On connect, the app logs endpoint domains and IP addresses — you can add those to exclusions if per-process exclusions aren't available. That said, in the Happ client it didn't work for me even with that (but it works fine without TUN, e.g. for Telegram).
+The app requests the following at runtime / install time:
+
+- `BIND_VPN_SERVICE` — required to register `BtfVpnService` as a system VPN.
+- `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_DATA_SYNC` — required to keep the VPN alive in the background.
+- `WAKE_LOCK` — held while the tunnel is up so the device doesn't sleep mid-session.
+- `INTERNET` — for the upstream WebSocket.
+
+On the first connect, Android shows the system "Connection request" dialog ("…wants to set up a VPN connection"). Approve it once.
 
 ## Build
 
 ```bash
-cd client
+cd maui-client
 
-# Android (Debug)
+# Debug
 dotnet build -f net10.0-android
 
-# Android (Release APK)
+# Release APK
 dotnet publish -f net10.0-android -c Release
-
-# iOS (requires a Mac with Xcode)
-dotnet build -f net10.0-ios
-
-# Windows
-dotnet build -f net10.0-windows10.0.19041.0
-
-# macOS (Mac only)
-dotnet build -f net10.0-maccatalyst
 ```
 
-The Android APK will be in `bin/Release/net10.0-android/publish/`.
+The APK lands in `bin/Release/net10.0-android/publish/`.
 
 ## Usage
 
-1. Enter **Bridge URL** — the helper endpoint of the API Gateway (e.g. `wss://gateway.example.com/_helper`)
-2. Enter **Auth Token** — the shared secret matching the adapter and Cloud Function
-3. Set **Listen Address** and **Port** — where clients should connect (default `127.0.0.1:1080`)
-4. If your device cannot reach the `wsSend` API directly, enable **Relay mode**
-5. Press **CONNECT**
+1. Enter **Bridge URL** — helper endpoint of the API Gateway (e.g. `wss://gateway.example.com/_helper`).
+2. Enter **Auth Token** — the shared secret that matches the adapter and Cloud Function.
+3. **Tunnel Address** — local IP for the on-device TUN (default `10.200.0.2`).
+4. **Peer Address** — adapter's tunnel IP (default `10.200.0.1`).
+5. **MTU** — default `1400`. Lower if your network drops larger packets.
+6. **Relay mode** — enable if the device cannot reach the YC `wsSend` gRPC API directly.
+7. **Per-app tunneling** *(strongly recommended — see "What it's good for" above)* — pick a list of apps that should be routed through the tunnel; everything else stays on the regular connection. For the recommended Telegram-only setup, select just Telegram here. If you leave the list empty, **all** apps are routed through the tunnel (except this app itself, automatically).
+8. Press **CONNECT** and approve the VPN permission prompt.
 
-The app keeps the tunnel running in the background:
-- **Android**: foreground service with a wake lock
-- **iOS**: `beginBackgroundTask` + `BGProcessingTask`
+The app routes the device's default route (`0.0.0.0/0`) through the TUN with DNS `1.1.1.1` / `8.8.8.8`. If per-app tunneling is configured, Android applies the allow-list at the OS level — non-selected apps bypass the VPN entirely. Either way, this app's own package is excluded from its own VPN so the WebSocket itself doesn't loop through.
 
-Press **DISCONNECT** to stop.
+The foreground service shows a persistent notification while the tunnel is up. Press **DISCONNECT** to stop and tear down the VPN.
 
-Settings are saved automatically and restored on next launch; they can also be imported/exported as a URL.
+Settings are saved automatically and restored on next launch.
+
+## Loop avoidance
+
+The Android `VpnService` API does not allow per-host route exclusions, so the app excludes its own package instead. If you also use another VPN/TUN-style proxy app on the device, only one of them can be active at a time — Android only allows a single active VPN.
+
+## Troubleshooting
+
+- **"VPN permission denied"** — the user rejected the system prompt. Toggle CONNECT again to re-prompt.
+- **Tunnel up but no traffic** — most often the adapter side hasn't enabled `net.ipv4.ip_forward` or hasn't installed the MASQUERADE rule. See the root [README.md](../README.md#server-side-ip-forwarding-linux). If you're using per-app tunneling, double-check that the apps you expect to be tunneled are actually selected in the list.
+- **Disconnects every ~10 minutes** — `pingIntervalMs` on the adapter side is too high; YC closes idle WebSockets at 10 min.
+- **Telegram works, browser doesn't** — that's expected. See "What it's good for" at the top.

@@ -1,6 +1,8 @@
-﻿// Bridge to Freedom v4 — Yandex Cloud Function
+// Bridge to Freedom v5 (IP-tunnel) — Yandex Cloud Function
 // Discovery service: exchanges connection IDs between adapter and helper.
-// Optionally relays helper's stream frames to the adapter (relay mode).
+// Optionally relays helper's IP-packet frames to the adapter (relay mode).
+//
+// Wire format: [1B type][payload]   (no streamID/seqID — that was v4).
 //
 // Env: AUTH_TOKEN (required), ADAPTER_URL (required — for /conn-ids fetch on init)
 
@@ -11,38 +13,34 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const ADAPTER_URL = process.env.ADAPTER_URL || null;
 
 const httpsAgent = new https.Agent({ keepAlive: true });
-const httpAgent = new http.Agent({ keepAlive: true });
+const httpAgent  = new http.Agent({ keepAlive: true });
+
+// --- Protocol constants ---
+const MSG_HELLO        = 0x01;
+const MSG_HELLO_OK     = 0x02;
+const MSG_HELLO_ERR    = 0x03;
+const MSG_PEER_CONN    = 0x04;
+const MSG_PEER_GONE    = 0x05;
+const MSG_SYNC         = 0x06;
+const MSG_PACKET       = 0x10;
+const MSG_PACKET_BATCH = 0x11;
+const MSG_PING         = 0xF0;
+const MSG_PONG         = 0xF1;
 
 // Message type names for logging.
 const MSG_NAMES = {
   0x01: 'HELLO', 0x02: 'HELLO_OK', 0x03: 'HELLO_ERR',
   0x04: 'PEER_CONN', 0x05: 'PEER_GONE', 0x06: 'SYNC',
-  0x10: 'OPEN', 0x11: 'OPEN_OK', 0x12: 'OPEN_FAIL',
-  0x20: 'DATA', 0x21: 'FIN', 0x22: 'RST',
+  0x10: 'PACKET', 0x11: 'PACKET_BATCH',
   0xF0: 'PING', 0xF1: 'PONG',
 };
 function msgName(type) { return MSG_NAMES[type] || '0x' + type.toString(16); }
 
 // --- State (local cache per instance) ---
 let adapterConnId = null;
-let helperConnId = null;
-let _initPromise = null;
-let _lastFetchMs = 0; // timestamp of last fetchConnIds call
-
-// --- Protocol constants ---
-const MSG_HELLO     = 0x01;
-const MSG_HELLO_OK  = 0x02;
-const MSG_HELLO_ERR = 0x03;
-const MSG_PEER_CONN = 0x04;
-const MSG_PEER_GONE = 0x05;
-const MSG_SYNC      = 0x06;
-const MSG_PING      = 0xF0;
-const MSG_PONG      = 0xF1;
-const MSG_OPEN      = 0x10;
-const MSG_OPEN_FAIL = 0x12;
-const MSG_DATA      = 0x20;
-const MSG_FIN       = 0x21;
-const MSG_RST       = 0x22;
+let helperConnId  = null;
+let _initPromise  = null;
+let _lastFetchMs  = 0;
 
 // --- Helpers ---
 
@@ -72,7 +70,7 @@ async function fetchConnIds() {
       if (r.status === 200 && r.body) {
         const data = JSON.parse(r.body);
         if (data.adapterConnId) adapterConnId = data.adapterConnId;
-        if (data.helperConnId) helperConnId = data.helperConnId;
+        if (data.helperConnId)  helperConnId  = data.helperConnId;
         console.log(`fetchConnIds OK adapter=${adapterConnId || 'null'} helper=${helperConnId || 'null'}`);
         return;
       }
@@ -80,7 +78,6 @@ async function fetchConnIds() {
     } catch (e) {
       console.error(`fetchConnIds attempt=${attempt} err=${e.message || e}`);
     }
-    // Wait before retry (500ms, 1s)
     if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 500));
   }
   console.warn('fetchConnIds: all retries exhausted, proceeding without conn-ids');
@@ -94,7 +91,7 @@ async function ensurePeerKnown(which) {
   const now = Date.now();
   if (now - _lastFetchMs < 2000) return;
   if (which === 'adapter' && adapterConnId) return;
-  if (which === 'helper' && helperConnId) return;
+  if (which === 'helper'  && helperConnId)  return;
   console.log(`ensurePeerKnown: ${which} unknown, calling fetchConnIds`);
   _lastFetchMs = now;
   await fetchConnIds();
@@ -105,7 +102,7 @@ async function wsSend(connId, data, token) {
   const b64 = Buffer.from(data).toString('base64');
   const body = JSON.stringify({ data: b64, type: 'BINARY' });
   const start = Date.now();
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const req = https.request({
       hostname: 'apigateway-connections.api.cloud.yandex.net',
       path: `/apigateways/websocket/v1/connections/${encodeURIComponent(connId)}:send`,
@@ -132,21 +129,19 @@ async function wsSend(connId, data, token) {
 
 // --- Protocol encode helpers ---
 
-// Frame: [1B type][4B streamID=0][4B seqID=0][payload]
-function encodeControl(type, payload) {
+// Frame: [1B type][payload]
+function encodeFrame(type, payload) {
   const p = payload || Buffer.alloc(0);
-  const buf = Buffer.alloc(9 + p.length);
+  const buf = Buffer.alloc(1 + p.length);
   buf[0] = type;
-  buf.writeUInt32BE(0, 1); // streamID = 0
-  buf.writeUInt32BE(0, 5); // seqID = 0
-  p.copy(buf, 9);
+  p.copy(buf, 1);
   return buf;
 }
 
 // HELLO_OK payload: [2B ownIdLen][ownId][2B peerIdLen][peerId][2B tokenLen][token]
 function encodeHelloOK(ownId, peerId, iamToken) {
-  const o = Buffer.from(ownId || '', 'utf-8');
-  const p = Buffer.from(peerId || '', 'utf-8');
+  const o = Buffer.from(ownId    || '', 'utf-8');
+  const p = Buffer.from(peerId   || '', 'utf-8');
   const t = Buffer.from(iamToken || '', 'utf-8');
   const buf = Buffer.alloc(2 + o.length + 2 + p.length + 2 + t.length);
   let off = 0;
@@ -158,7 +153,7 @@ function encodeHelloOK(ownId, peerId, iamToken) {
 
 // PEER_CONN payload: [2B peerIdLen][peerId][2B tokenLen][token]
 function encodePeerConn(peerId, iamToken) {
-  const p = Buffer.from(peerId || '', 'utf-8');
+  const p = Buffer.from(peerId   || '', 'utf-8');
   const t = Buffer.from(iamToken || '', 'utf-8');
   const buf = Buffer.alloc(2 + p.length + 2 + t.length);
   let off = 0;
@@ -173,17 +168,6 @@ function encodePong(iamToken) {
   const buf = Buffer.alloc(2 + t.length);
   buf.writeUInt16BE(t.length, 0);
   t.copy(buf, 2);
-  return buf;
-}
-
-// Encode a stream-level frame (OPEN_FAIL, RST, etc.) with a specific streamId.
-function encodeStreamFrame(type, streamId, payload) {
-  const p = payload || Buffer.alloc(0);
-  const buf = Buffer.alloc(9 + p.length);
-  buf[0] = type;
-  buf.writeUInt32BE(streamId, 1);
-  buf.writeUInt32BE(0, 5); // seqID = 0
-  p.copy(buf, 9);
   return buf;
 }
 
@@ -219,58 +203,59 @@ async function handle(event, context) {
       if (!adapterConnId) { adapterConnId = connId; console.log(`adapter connId recovered from message: ${connId}`); }
 
       const buf = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body || '');
-      if (buf.length < 9) { console.warn(`adapter MESSAGE too short len=${buf.length}`); return { statusCode: 200 }; }
+      if (buf.length < 1) { console.warn(`adapter MESSAGE empty`); return { statusCode: 200 }; }
       const type = buf[0];
-      const streamId = buf.readUInt32BE(1);
-      const seqId = buf.readUInt32BE(5);
-      console.log(`adapter MESSAGE type=${msgName(type)} streamId=${streamId} seq=${seqId} len=${buf.length}`);
+      const payload = buf.subarray(1);
+      console.log(`adapter MESSAGE type=${msgName(type)} len=${buf.length}`);
 
       if (type === MSG_HELLO) {
-        const ver = buf[9];
-        const tok = buf.subarray(10).toString('utf-8');
+        if (payload.length < 1) {
+          console.error('adapter HELLO: payload too short');
+          return binaryResp(encodeFrame(MSG_HELLO_ERR, Buffer.from('bad hello')));
+        }
+        const ver = payload[0];
+        const tok = payload.subarray(1).toString('utf-8');
         if (ver !== 1 || tok !== AUTH_TOKEN) {
           console.error(`adapter HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
-          return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
+          return binaryResp(encodeFrame(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
         if (!helperConnId) await ensurePeerKnown('helper');
         if (helperConnId) {
           console.log(`adapter HELLO: notifying helper ${helperConnId} of adapter connId`);
-          const st = await wsSend(helperConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
+          const st = await wsSend(helperConnId, encodeFrame(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
           if (st >= 400) {
             console.log(`adapter HELLO: helper ${helperConnId} is stale (status=${st}), clearing`);
             helperConnId = null;
           }
         }
         console.log(`adapter authenticated connId=${adapterConnId} helperConnId=${helperConnId || 'null'} tokenLen=${token.length}`);
-        return binaryResp(encodeControl(MSG_HELLO_OK, encodeHelloOK(adapterConnId, helperConnId, token)));
+        return binaryResp(encodeFrame(MSG_HELLO_OK, encodeHelloOK(adapterConnId, helperConnId, token)));
       }
       if (type === MSG_PING) {
-        // Re-learn adapter connId from this message
         if (adapterConnId !== connId) {
           console.log(`adapter PING: re-learned adapterConnId=${connId} (was ${adapterConnId || 'null'})`);
           adapterConnId = connId;
         }
         if (!helperConnId) await ensurePeerKnown('helper');
-        // If we now know both sides, notify helper of adapter (covers cross-instance state loss)
         if (helperConnId) {
           console.log(`adapter PING: cross-notifying helper ${helperConnId} of adapter connId`);
-          const st = await wsSend(helperConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
+          const st = await wsSend(helperConnId, encodeFrame(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
           if (st >= 400) {
             console.log(`adapter PING: helper ${helperConnId} is stale (status=${st}), clearing`);
             helperConnId = null;
           }
         }
         console.log(`adapter PING -> PONG tokenLen=${token.length}`);
-        return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
+        return binaryResp(encodeFrame(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
         if (!helperConnId) await ensurePeerKnown('helper');
         if (helperConnId) {
           console.log(`adapter SYNC -> PEER_CONN helperConnId=${helperConnId}`);
-          return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)));
+          return binaryResp(encodeFrame(MSG_PEER_CONN, encodePeerConn(helperConnId, token)));
         }
         console.log('adapter SYNC -> PEER_GONE (no helper)');
-        return binaryResp(encodeControl(MSG_PEER_GONE));
+        return binaryResp(encodeFrame(MSG_PEER_GONE));
       }
       console.warn(`adapter MESSAGE: unhandled type=${msgName(type)}`);
       return { statusCode: 200 };
@@ -281,7 +266,7 @@ async function handle(event, context) {
       console.log(`adapter DISCONNECT connId=${connId} wasKnown=${wasKnown}`);
       if (helperConnId) {
         console.log(`adapter DISCONNECT: notifying helper ${helperConnId} of PEER_GONE`);
-        await wsSend(helperConnId, encodeControl(MSG_PEER_GONE), token);
+        await wsSend(helperConnId, encodeFrame(MSG_PEER_GONE), token);
       }
       return { statusCode: 200 };
     }
@@ -300,83 +285,78 @@ async function handle(event, context) {
       if (!helperConnId) { helperConnId = connId; console.log(`helper connId recovered from message: ${connId}`); }
 
       const buf = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body || '');
-      if (buf.length < 9) { console.warn(`helper MESSAGE too short len=${buf.length}`); return { statusCode: 200 }; }
+      if (buf.length < 1) { console.warn(`helper MESSAGE empty`); return { statusCode: 200 }; }
       const type = buf[0];
-      const streamId = buf.readUInt32BE(1);
-      const seqId = buf.readUInt32BE(5);
-      console.log(`helper MESSAGE type=${msgName(type)} streamId=${streamId} seq=${seqId} len=${buf.length}`);
+      const payload = buf.subarray(1);
+      console.log(`helper MESSAGE type=${msgName(type)} len=${buf.length}`);
 
-      // Stream frames (type >= 0x10): relay to adapter
-      if (type >= 0x10) {
+      // Data frames: relay raw to adapter (relay mode). Only PACKET / PACKET_BATCH.
+      // Note: PING (0xF0) is NOT a data frame even though 0xF0 >= 0x10 — handle explicitly.
+      if (type === MSG_PACKET || type === MSG_PACKET_BATCH) {
         if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
-          console.log(`relay ${msgName(type)} streamId=${streamId} seq=${seqId} -> adapter ${adapterConnId} bytes=${buf.length}`);
+          console.log(`relay ${msgName(type)} -> adapter ${adapterConnId} bytes=${buf.length}`);
           const st = await wsSend(adapterConnId, buf, token);
           if (st >= 400) {
             console.error(`relay FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
             adapterConnId = null;
-            // Return error frame so helper doesn't wait forever
-            if (type === MSG_OPEN) {
-              return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('adapter unreachable')));
-            }
-            return binaryResp(encodeStreamFrame(MSG_RST, streamId));
+            // No protocol-level NACK in v5 — IP packets are best-effort,
+            // TCP retransmission inside the tunnel handles loss.
           }
         } else {
-          console.warn(`relay DROP ${msgName(type)} streamId=${streamId}: no adapter connected`);
-          if (type === MSG_OPEN) {
-            return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('no adapter connected')));
-          }
-          return binaryResp(encodeStreamFrame(MSG_RST, streamId));
+          console.warn(`relay DROP ${msgName(type)}: no adapter connected`);
         }
         return { statusCode: 200 };
       }
 
       if (type === MSG_HELLO) {
-        const ver = buf[9];
-        const tok = buf.subarray(10).toString('utf-8');
+        if (payload.length < 1) {
+          console.error('helper HELLO: payload too short');
+          return binaryResp(encodeFrame(MSG_HELLO_ERR, Buffer.from('bad hello')));
+        }
+        const ver = payload[0];
+        const tok = payload.subarray(1).toString('utf-8');
         if (ver !== 1 || tok !== AUTH_TOKEN) {
           console.error(`helper HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
-          return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
+          return binaryResp(encodeFrame(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
         if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
           console.log(`helper HELLO: notifying adapter ${adapterConnId} of helper connId`);
-          const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
+          const st = await wsSend(adapterConnId, encodeFrame(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
           if (st >= 400) {
             console.log(`helper HELLO: adapter ${adapterConnId} is stale (status=${st}), clearing`);
             adapterConnId = null;
           }
         }
         console.log(`helper authenticated connId=${helperConnId} adapterConnId=${adapterConnId || 'null'} tokenLen=${token.length}`);
-        return binaryResp(encodeControl(MSG_HELLO_OK, encodeHelloOK(helperConnId, adapterConnId, token)));
+        return binaryResp(encodeFrame(MSG_HELLO_OK, encodeHelloOK(helperConnId, adapterConnId, token)));
       }
       if (type === MSG_PING) {
-        // Re-learn helper connId from this message
         if (helperConnId !== connId) {
           console.log(`helper PING: re-learned helperConnId=${connId} (was ${helperConnId || 'null'})`);
           helperConnId = connId;
         }
         if (!adapterConnId) await ensurePeerKnown('adapter');
-        // If we now know both sides, notify adapter of helper (covers cross-instance state loss)
         if (adapterConnId) {
           console.log(`helper PING: cross-notifying adapter ${adapterConnId} of helper connId`);
-          const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
+          const st = await wsSend(adapterConnId, encodeFrame(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
           if (st >= 400) {
             console.log(`helper PING: adapter ${adapterConnId} is stale (status=${st}), clearing`);
             adapterConnId = null;
           }
         }
         console.log(`helper PING -> PONG tokenLen=${token.length}`);
-        return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
+        return binaryResp(encodeFrame(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
         if (!adapterConnId) await ensurePeerKnown('adapter');
         if (adapterConnId) {
           console.log(`helper SYNC -> PEER_CONN adapterConnId=${adapterConnId}`);
-          return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)));
+          return binaryResp(encodeFrame(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)));
         }
         console.log('helper SYNC -> PEER_GONE (no adapter)');
-        return binaryResp(encodeControl(MSG_PEER_GONE));
+        return binaryResp(encodeFrame(MSG_PEER_GONE));
       }
       console.warn(`helper MESSAGE: unhandled type=${msgName(type)}`);
       return { statusCode: 200 };
@@ -387,7 +367,7 @@ async function handle(event, context) {
       console.log(`helper DISCONNECT connId=${connId} wasKnown=${wasKnown}`);
       if (adapterConnId) {
         console.log(`helper DISCONNECT: notifying adapter ${adapterConnId} of PEER_GONE`);
-        await wsSend(adapterConnId, encodeControl(MSG_PEER_GONE), token);
+        await wsSend(adapterConnId, encodeFrame(MSG_PEER_GONE), token);
       }
       return { statusCode: 200 };
     }
