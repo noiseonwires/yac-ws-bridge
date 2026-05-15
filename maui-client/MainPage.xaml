@@ -55,7 +55,7 @@
                         <Label Text="Listen Address" FontSize="12"
                                TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
                         <Entry x:Name="ListenAddressEntry"
-                               Text="127.0.0.1"
+                               Text="127.123.45.67"
                                IsEnabled="{Binding IsNotRunning}" />
                     </VerticalStackLayout>
                     <VerticalStackLayout Grid.Column="1" Spacing="4">

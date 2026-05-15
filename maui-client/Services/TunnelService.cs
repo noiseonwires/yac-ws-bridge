@@ -79,7 +79,7 @@ public sealed class TunnelService : IDisposable
     // Config
     public string BridgeUrl { get; set; } = "";
     public string AuthToken { get; set; } = "";
-    public string ListenAddress { get; set; } = "0.0.0.0";
+    public string ListenAddress { get; set; } = "127.123.45.67";
     public int ListenPort { get; set; } = 5080;
     public bool Relay { get; set; }
     // Periodic PING to refresh IAM token (PONG carries it) and keep the upstream

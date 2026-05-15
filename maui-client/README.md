@@ -56,7 +56,7 @@ The Android APK will be in `bin/Release/net10.0-android/publish/`.
 
 1. Enter **Bridge URL** — the helper endpoint of the API Gateway (e.g. `wss://gateway.example.com/_helper`)
 2. Enter **Auth Token** — the shared secret matching the adapter and Cloud Function
-3. Set **Listen Address** and **Port** — where clients should connect (default `127.0.0.1:5080`)
+3. Set **Listen Address** and **Port** — where clients should connect (default `127.123.45.67:5080`). If you want to share the tunnel with other devices on your local network, change the address to `0.0.0.0` manually so the listener binds on all interfaces.
 4. If your device cannot reach the `wsSend` API directly, enable **Relay mode**. Recommendation: don't enable relay mode unless you have to — only use it if direct mode doesn't work for you. Direct mode is faster and more stable.
 5. Press **CONNECT**
 
@@ -72,7 +72,7 @@ Settings are saved automatically and restored on next launch; they can also be i
 
 The combination below has proven both effective and stable:
 
-- On the phone: install this app (BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.0.0.1:5080`. Start BTF first and connect to the server, then enable v2rayNG.
+- On the phone: install this app (BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.123.45.67:5080`. Start BTF first and connect to the server, then enable v2rayNG.
 - On the adapter side (VPS): run Dante (SOCKS) or XRay (VLESS) listening on whatever address the adapter forwards to (i.e. the adapter's `target.address`). The adapter delivers each incoming TCP stream to it and the proxy then exits to the open internet.
 
 Flow: `app → v2rayNG (per-app) → BTF helper :5080 → YC → BTF adapter → Dante/XRay → internet`.

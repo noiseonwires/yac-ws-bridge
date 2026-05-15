@@ -23,7 +23,7 @@ public partial class MainPage : ContentPage
         // Load saved settings
         BridgeUrlEntry.Text = Preferences.Default.Get("BridgeUrl", "wss://");
         AuthTokenEntry.Text = Preferences.Default.Get("AuthToken", "");
-        ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "0.0.0.0");
+        ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "127.123.45.67");
         ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "5080");
         RelaySwitch.IsToggled = Preferences.Default.Get("Relay", false);
         CoalesceSwitch.IsToggled = Preferences.Default.Get("WriteCoalescing", false);
@@ -144,7 +144,7 @@ public partial class MainPage : ContentPage
 
         _tunnel.BridgeUrl = url;
         _tunnel.AuthToken = token;
-        _tunnel.ListenAddress = addr ?? "0.0.0.0";
+        _tunnel.ListenAddress = addr ?? "127.123.45.67";
         _tunnel.ListenPort = port;
         _tunnel.Relay = RelaySwitch.IsToggled;
         _tunnel.WriteCoalescing = CoalesceSwitch.IsToggled;
@@ -152,7 +152,7 @@ public partial class MainPage : ContentPage
         // Save settings
         Preferences.Default.Set("BridgeUrl", url);
         Preferences.Default.Set("AuthToken", token);
-        Preferences.Default.Set("ListenAddress", addr ?? "0.0.0.0");
+        Preferences.Default.Set("ListenAddress", addr ?? "127.123.45.67");
         Preferences.Default.Set("ListenPort", portStr!);
         Preferences.Default.Set("Relay", RelaySwitch.IsToggled);
         Preferences.Default.Set("WriteCoalescing", CoalesceSwitch.IsToggled);

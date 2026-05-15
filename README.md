@@ -58,7 +58,7 @@ Client ◄──TCP── Helper ◄──WS────────── API G
 Three pieces need to be in place. Detailed configuration for each lives in its own section below; here is the high-level order:
 
 1. **Adapter** — build it (see [Adapter / Build](#build)) and run it on a remote server, ideally next to whatever you ultimately proxy through (Dante / XRay-core / etc.). It must expose its `/conn-ids` HTTP port to the public internet so the Serverless Function can reach it on cold start.
-2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `ADAPTER_CONN_IDS_URL` env var to your adapter's `https://<server>:<port>/conn-ids`, and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
+2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `ADAPTER_URL` env var to your adapter's HTTP base (e.g. `https://<server>:<port>` — the function appends the `/conn-ids` path itself), and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
 3. **Client** — configure the Go helper or the MAUI app with the same `bridge.url` (the API Gateway URL ending in `/_helper`) and `authToken`. Start it, point your apps at the helper's local listen port, and you're done.
 
 ## How it works
@@ -96,7 +96,7 @@ Recommendations:
 
 - Use this only for proxying the most important low-traffic services (for example, tunnel through to a SOCKS proxy and plug it into Telegram as 127.0.0.1). Don't abuse it by pushing large amounts of data.
 
-- Before uploading the serverless function code, run it through any JavaScript obfuscator (a couple of times, even). In the serverless function, adapter, and helper code, replace all the default paths (`/_upstream`, `/_helper`, `/_conn-ids`) with random ones of your own.
+- Before uploading the serverless function code, run it through any JavaScript obfuscator (a couple of times, even). Also, rename the default endpoint paths (`/_adapter`, `/_helper`, `/conn-ids`) to random ones of your own — see [Customizing endpoint paths](#customizing-endpoint-paths) below for how to do that.
 
 ### Also important
 
@@ -106,10 +106,32 @@ If you use a proxy client that works as a TUN, you must add an exclusion for the
 
 The combination below has proven both effective and stable:
 
-- On the phone: install the MAUI client (this app, BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — this is important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.0.0.1:5080`. Start BTF first and connect to the server, then enable v2rayNG.
+- On the phone: install the MAUI client (this app, BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — this is important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.123.45.67:5080`. Start BTF first and connect to the server, then enable v2rayNG.
 - On the adapter side (VPS): run Dante (SOCKS) or XRay (VLESS) listening on whatever address the adapter forwards to (i.e. the adapter's `target.address`). The adapter delivers each incoming TCP stream to it and the proxy then exits to the open internet.
 
 Flow: `app → v2rayNG (per-app) → BTF helper :5080 → YC → BTF adapter → Dante/XRay → internet`.
+
+---
+
+## Customizing endpoint paths
+
+To avoid a recognisable URL structure, you can rename all of the default endpoint paths to anything you like. None of these paths are part of the wire protocol — they are just labels. Defenders fingerprint on whatever is unique, so changing them is recommended.
+
+**WebSocket paths (`/_adapter`, `/_helper`) — configurable without touching code.**
+
+1. In [`bridge-cloud/spec.yaml`](bridge-cloud/spec.yaml), rename the two top-level path keys (`/_adapter` and `/_helper`) to arbitrary strings, e.g. `/q7x` and `/k2m`. **Do not** change the `context.route` values (`adapter`, `helper`) — those are internal labels the function code switches on.
+2. Update `bridge.url` in [`adapter.config.yaml`](adapter-and-helper/adapter.config.yaml) to use the new adapter path.
+3. Update `bridge.url` in [`helper.config.yaml`](adapter-and-helper/helper.config.yaml) (or the **Bridge URL** field in the MAUI app) to use the new helper path.
+4. Redeploy the API Gateway with the updated spec.
+
+**HTTP path `/conn-ids` — currently hardcoded in two source files.**
+
+The adapter's HTTP endpoint that the Cloud Function polls on cold start is `/conn-ids`. To rename it, change both:
+
+- [`adapter-and-helper/cmd/adapter/main.go`](adapter-and-helper/cmd/adapter/main.go) — the `mux.HandleFunc("/conn-ids", ...)` line.
+- [`bridge-cloud/index.js`](bridge-cloud/index.js) — the line that builds the URL: `ADAPTER_URL.replace(/\/+$/, '') + '/conn-ids'`.
+
+Then rebuild the adapter and redeploy the function. Log strings mentioning `/conn-ids` can stay as-is — they are not visible externally.
 
 ---
 
