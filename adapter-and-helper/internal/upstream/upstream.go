@@ -240,7 +240,6 @@ func (u *Upstream) pingLoop(ctx context.Context, interval time.Duration) {
 			u.writeMu.Lock()
 			c.WriteMessage(websocket.BinaryMessage, f)
 			u.writeMu.Unlock()
-			}
 		}
 	}
 }

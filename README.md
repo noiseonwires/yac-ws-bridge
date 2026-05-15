@@ -6,15 +6,20 @@ A TCP and WebSocket tunnel via YC (using Serverless Functions and API Gateway, a
 
 See [README_RU.md](README_RU.md) for documentation in Russian.
 
+## What's new — 2026-05-15
+
+This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so the first DATA packets after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections are established noticeably faster and the tunnel is significantly more stable, especially on mobile.
+
+
 The tunnel comes in four variants:
 
 1. Single-adapter variant (branch `one-adapter`): proxies WebSocket connections (VLESS with WS transport or XMPP-over-WebSockets, for example). Does not require modifying clients or installing extra software on the client device — just point your WebSocket URL at the serverless function. Works slowly and very unstably. See README_RU.md in the `one-adapter` branch for details.
 
-2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster.
+2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster. **(Use this version if you don't know from where to start!)**
 
 3. Experimental variant (branch `experimental`), similar to variant 2 but instead of a custom multiplexing/error-correction algorithm it uses QUIC wrapped in WebSocket messages.
 
-4. IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter. **Android-only** (uses `VpnService`) but supports **per-app tunneling**, so you can route only the apps you want. Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but works surprisingly well for Telegram. See README/README_RU on the `ip-tun` branch for details.
+4. Experimental IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter. **Android-only** (uses `VpnService`) but supports **per-app tunneling**, so you can route only the apps you want. Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but acceptable for Telegram. See README/README_RU on the `ip-tun` branch for details.
 
 In the adapter + helper variant:
 
@@ -37,6 +42,13 @@ Client ◄──TCP── Helper ◄──WS────────── API G
                      │    (discovery only)     │
                      └─────────────────────────┘
 ```
+
+
+## Important notices
+
+> HIGHLY RECOMMENDED: BEFORE YOU UPLOAD THE CLOUD FUNCTION TO YANDEX, OBFUSCATE THE JAVASCRIPT CODE (for example with `javascript-obfuscator`). The plain source may attract unwanted attention. It is fine to deploy the plain code once to verify the setup works end-to-end — but as soon as you confirm it works, replace it with an obfuscated build.
+
+> This is a proof-of-concept and a messy hobby project. No guarantees of any kind. The wire protocol, configuration format and APIs can change at any time - sometimes every day. Whenever you pull a new revision, ALWAYS update all three components together: Cloud Function (`bridge-cloud/`), adapter, and helper / MAUI app. Mixing versions across these components will almost certainly break the tunnel in subtle and frustrating ways.
 
 ## How it works
 
@@ -64,9 +76,11 @@ Multiple clients to the same function/adapter result in undefined behavior (ever
 
 If the helper cannot reach the `wsSend` gRPC endpoint (the YC API — for example on a restricted network), set `wsApi.relay: true`. The helper sends data through its upstream WebSocket and the Serverless Function relays it to the adapter. The reverse path (adapter → helper) still uses `wsSend` directly. Relay mode is slower and less stable for the same reasons as the single-adapter (one-branch) variant, but is still more stable thanks to proper multiplexing.
 
+> **Recommendation:** don't use relay mode. Turn it on only if it doesn't work without it (i.e. your network blocks the access to gRPC API endpoint). Direct mode is faster and more stable in every scenario.
+
 ---
 
-## Important
+## One more time, important things
 
 How long until Yandex bans you for this — no idea.
 
@@ -79,6 +93,15 @@ Recommendations:
 ### Also important
 
 If you use a proxy client that works as a TUN, you must add an exclusion for the helper process, otherwise you'll get an infinite loop and nothing will work. The mobile app (MAUI) writes endpoint domains and IP addresses to the log on connect — you can add those to exclusions if per-process exclusions aren't available. That said, in the Happ client it didn't work for me even with that (but it works fine without TUN, e.g. for the same TG).
+
+### Recommended setup for Android (proven stable)
+
+The combination below has proven both effective and stable:
+
+- On the phone: install the MAUI client (this app, BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — this is important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.0.0.1:5080`. Start BTF first and connect to the server, then enable v2rayNG.
+- On the adapter side (VPS): run Dante (SOCKS) or XRay (VLESS) listening on whatever address the adapter forwards to (i.e. the adapter's `target.address`). The adapter delivers each incoming TCP stream to it and the proxy then exits to the open internet.
+
+Flow: `app → v2rayNG (per-app) → BTF helper :5080 → YC → BTF adapter → Dante/XRay → internet`.
 
 ---
 

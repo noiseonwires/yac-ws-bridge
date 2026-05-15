@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Threading.Channels;
 
 namespace BridgeToFreedom.Services;
 
@@ -55,22 +56,50 @@ public sealed class TunnelService : IDisposable
         public CancellationTokenSource Cts;
         public volatile bool Closed;
 
+        // Lifecycle flags for graceful half-close.
+        public volatile bool OpenConfirmed;     // OPEN_OK received
+        public volatile bool RemoteWriteEnded;  // FIN received from peer
+        public volatile bool LocalReadEnded;    // local TCP EOF, FIN sent to peer
+
+        // Async writer queue: payloads from the upstream WS to be written to
+        // the local TCP socket. Decouples the WS receive loop from local TCP
+        // backpressure (a slow local client must NOT stall the receive loop
+        // — that would block every other stream and starve OPEN_OK/PONG).
+        public readonly Channel<byte[]> WriteQueue;
+        public Task? WriterTask;
+
+        // Per-stream reorder buffer for incoming stream frames. Frames from
+        // the peer are sent serially per-stream, but the helper→adapter and
+        // adapter→helper paths each go through the YC `wsSend` REST API,
+        // whose underlying parallel HTTP processing can deliver frames to
+        // the recipient WebSocket out of order. Sequence numbers allow us
+        // to restore in-order delivery (matches Go adapter's Reorder=true).
+        public uint ExpectedRecvSeq = 1;
+        public readonly Dictionary<uint, byte[]> ReorderPending = new();
+        public readonly object ReorderLock = new();
+
         public StreamState(uint id, TcpClient client)
         {
             Id = id;
             Client = client;
             NetStream = client.GetStream();
             Cts = new CancellationTokenSource();
+            WriteQueue = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false,
+            });
         }
 
         public void Dispose()
         {
             if (Closed) return;
             Closed = true;
-            Cts.Cancel();
+            try { WriteQueue.Writer.TryComplete(); } catch { }
+            try { Cts.Cancel(); } catch { }
             try { NetStream.Dispose(); } catch { }
             try { Client.Dispose(); } catch { }
-            Cts.Dispose();
+            try { Cts.Dispose(); } catch { }
         }
     }
 
@@ -274,7 +303,7 @@ public sealed class TunnelService : IDisposable
     {
         try
         {
-            var (type, streamId, _, payload) = Protocol.Decode(data);
+            var (type, streamId, seqId, payload) = Protocol.Decode(data);
 
             switch (type)
             {
@@ -291,50 +320,196 @@ public sealed class TunnelService : IDisposable
                     _peerConnId = peerId;
                     if (iamToken != "") _iamToken = iamToken;
                     Log($"Peer connected: {Shorten(peerId)}");
-                    break;
+                    return;
 
                 case Protocol.MsgPeerGone:
                     Log($"Peer gone, closing {_streams.Count} streams");
                     _peerConnId = "";
                     CancelPendingOpens("peer gone");
                     CloseAllStreams();
-                    break;
+                    return;
 
                 case Protocol.MsgPong:
                     var token = Protocol.DecodePong(payload);
                     if (token != "") _iamToken = token;
-                    break;
+                    return;
 
                 case Protocol.MsgOpenOK:
                 case Protocol.MsgOpenFail:
-                    if (_pendingOpens.TryRemove(streamId, out var tcs))
-                        tcs.TrySetResult(data);
-                    else
-                        Log($"{Protocol.MsgName(type)} for unknown stream={streamId}");
-                    break;
-
                 case Protocol.MsgData:
-                    if (_streams.TryGetValue(streamId, out var s) && !s.Closed)
-                    {
-                        try { s.NetStream.Write(payload, 0, payload.Length); }
-                        catch { CloseStream(s); }
-                    }
-                    break;
-
                 case Protocol.MsgFin:
-                    Log($"FIN stream={streamId}");
-                    if (_streams.TryGetValue(streamId, out var fs))
-                        CloseStream(fs);
-                    break;
-
                 case Protocol.MsgRst:
-                    Log($"RST stream={streamId}");
-                    if (_streams.TryGetValue(streamId, out var rs))
-                        CloseStream(rs);
-                    break;
+                    if (!_streams.TryGetValue(streamId, out var s))
+                    {
+                        // OPEN_OK/OPEN_FAIL fallback for legacy code paths: try the pendingOpens
+                        // map directly (in case the stream was somehow not pre-registered).
+                        if ((type == Protocol.MsgOpenOK || type == Protocol.MsgOpenFail)
+                            && _pendingOpens.TryRemove(streamId, out var tcs))
+                        {
+                            tcs.TrySetResult(data);
+                            return;
+                        }
+                        // Likely a frame for a stream we already closed. Log at debug.
+                        Log($"{Protocol.MsgName(type)} for unknown stream={streamId} seq={seqId}, dropping");
+                        return;
+                    }
+                    DeliverStreamFrameOrdered(s, type, seqId, payload, data);
+                    return;
+
+                default:
+                    Log($"Unknown frame type=0x{type:X2} stream={streamId}");
+                    return;
             }
         }
         catch (Exception ex) { Log($"Frame error: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Routes an inbound stream frame through the per-stream reorder buffer.
+    /// Frames with seqId == 0 (legacy/uninitialized) are delivered immediately.
+    /// Otherwise frames are delivered strictly in ascending seqId order; gaps
+    /// are buffered until the missing predecessor arrives.
+    /// </summary>
+    private void DeliverStreamFrameOrdered(StreamState s, byte type, uint seqId, byte[] payload, byte[] rawData)
+    {
+        if (seqId == 0)
+        {
+            DispatchStreamFrame(s, type, payload, rawData);
+            return;
+        }
+
+        lock (s.ReorderLock)
+        {
+            if (seqId == s.ExpectedRecvSeq)
+            {
+                DispatchStreamFrame(s, type, payload, rawData);
+                s.ExpectedRecvSeq++;
+                // Drain any consecutive frames previously buffered out-of-order.
+                while (s.ReorderPending.TryGetValue(s.ExpectedRecvSeq, out var nextRaw))
+                {
+                    s.ReorderPending.Remove(s.ExpectedRecvSeq);
+                    var (nType, _, _, nPayload) = Protocol.Decode(nextRaw);
+                    DispatchStreamFrame(s, nType, nPayload, nextRaw);
+                    s.ExpectedRecvSeq++;
+                }
+            }
+            else if (seqId > s.ExpectedRecvSeq)
+            {
+                // Gap — buffer until the missing predecessor(s) arrive.
+                s.ReorderPending[seqId] = rawData;
+                var pending = s.ReorderPending.Count;
+                if (pending > 0 && pending % 50 == 0)
+                {
+                    Log($"reorder buffer growing stream={s.Id} pending={pending} " +
+                        $"expected={s.ExpectedRecvSeq} got={seqId}");
+                }
+            }
+            else
+            {
+                // seqId < expected: duplicate or stale frame.
+                Log($"duplicate/old frame stream={s.Id} seq={seqId} expected={s.ExpectedRecvSeq} type={Protocol.MsgName(type)}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dispatches an in-order stream frame to its handler. Must NOT do any
+    /// blocking I/O — DATA payloads are queued for the per-stream writer task
+    /// so the upstream WS receive loop is never stalled by a slow local TCP
+    /// consumer.
+    /// </summary>
+    private void DispatchStreamFrame(StreamState s, byte type, byte[] payload, byte[] rawData)
+    {
+        switch (type)
+        {
+            case Protocol.MsgOpenOK:
+            case Protocol.MsgOpenFail:
+                if (_pendingOpens.TryRemove(s.Id, out var tcs))
+                    tcs.TrySetResult(rawData);
+                else
+                    Log($"{Protocol.MsgName(type)} stream={s.Id}: no pending open (already opened or closed)");
+                break;
+
+            case Protocol.MsgData:
+                if (s.Closed) break;
+                if (!s.WriteQueue.Writer.TryWrite(payload))
+                {
+                    // Channel was completed — peer is sending DATA after we sent/received FIN.
+                    // Log and drop; protocol violation but harmless.
+                    Log($"DATA after close stream={s.Id} bytes={payload.Length}");
+                }
+                break;
+
+            case Protocol.MsgFin:
+                Log($"FIN stream={s.Id}");
+                s.RemoteWriteEnded = true;
+                // Signal end-of-stream to writer task. It will drain any
+                // buffered DATA, then half-close the local TCP send side so
+                // the local client sees EOF on its read.
+                s.WriteQueue.Writer.TryComplete();
+                break;
+
+            case Protocol.MsgRst:
+                Log($"RST stream={s.Id}");
+                CloseStream(s);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Per-stream writer task. Drains the inbound write queue and writes
+    /// payloads to the local TCP socket. On channel completion (FIN
+    /// received), shuts down the local socket's send side so the local
+    /// client sees EOF on its read. The stream is fully closed only when
+    /// BOTH directions have ended.
+    /// </summary>
+    private async Task WriterLoopAsync(StreamState s, CancellationToken ct)
+    {
+        try
+        {
+            var reader = s.WriteQueue.Reader;
+            while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
+            {
+                while (reader.TryRead(out var payload))
+                {
+                    if (s.Closed) return;
+                    try
+                    {
+                        await s.NetStream.WriteAsync(payload, 0, payload.Length, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch (Exception ex)
+                    {
+                        Log($"NetStream write stream={s.Id}: {ex.Message}");
+                        // Local socket is broken — send RST to peer and close.
+                        if (!s.LocalReadEnded)
+                        {
+                            try { _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgRst, s.Id, NextSeq(s.Id))); }
+                            catch { }
+                        }
+                        CloseStream(s);
+                        return;
+                    }
+                }
+            }
+
+            // Channel completed cleanly — FIN received from peer. Half-close
+            // the local socket's send side so the local app reads EOF, but
+            // leave the receive side open so we can still forward outgoing
+            // data until the local app finishes writing.
+            try
+            {
+                s.Client.Client.Shutdown(SocketShutdown.Send);
+            }
+            catch { /* socket already closed */ }
+
+            // If the local read side has already ended (FIN already sent to
+            // peer), both halves are done — fully close.
+            if (s.LocalReadEnded)
+                CloseStream(s);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Log($"Writer stream={s.Id}: {ex.Message}"); }
     }
 
     // --- TCP Listener ---
@@ -402,54 +577,116 @@ public sealed class TunnelService : IDisposable
         Log($"New connection remote={remote} stream={sid}");
 
         var state = new StreamState(sid, client);
-        var tcs = new TaskCompletionSource<byte[]>();
+
+        // Pre-register the stream BEFORE sending OPEN so that any DATA
+        // frames the peer sends immediately after OPEN_OK are not dropped
+        // by the receive loop during the brief window between OPEN_OK
+        // arriving and this task resuming. Until OPEN_OK is confirmed,
+        // queued DATA simply waits for the writer task.
+        if (!_streams.TryAdd(sid, state))
+        {
+            Log($"Stream id collision sid={sid}, aborting");
+            state.Dispose();
+            return;
+        }
+
+        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingOpens[sid] = tcs;
+
+        // Writer task has its own long-lived linked CTS (separate from the
+        // local TcpReadLoop one below) so it can keep delivering peer→local
+        // DATA even after this method returns (graceful half-close).
+        var writerCts = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cts.Token);
+        state.WriterTask = Task.Run(async () =>
+        {
+            try { await WriterLoopAsync(state, writerCts.Token); }
+            finally { try { writerCts.Dispose(); } catch { } }
+        }, writerCts.Token);
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cts.Token);
 
         try
         {
-            // Wait until upstream is connected and peer is known (up to 10s)
+            // Wait until upstream is connected and peer is known (up to 10s).
             if (!await WaitForReadyAsync(ct))
             {
                 Log($"OPEN failed stream={sid}: not ready (no upstream or peer)");
-                client.Dispose();
+                _pendingOpens.TryRemove(sid, out _);
+                CloseStream(state);
                 return;
             }
 
-            // Send OPEN
+            // Send OPEN.
             var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid, NextSeq(sid)));
-            if (err != null) { Log($"OPEN failed stream={sid}: {err}"); client.Dispose(); return; }
+            if (err != null)
+            {
+                Log($"OPEN failed stream={sid}: {err}");
+                _pendingOpens.TryRemove(sid, out _);
+                CloseStream(state);
+                return;
+            }
 
-            // Wait for OPEN_OK/OPEN_FAIL
+            // Wait for OPEN_OK or OPEN_FAIL.
             using var openCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             openCts.CancelAfter(TimeSpan.FromSeconds(10));
             byte[] resp;
             try { resp = await tcs.Task.WaitAsync(openCts.Token); }
-            catch (OperationCanceledException) { Log($"OPEN timeout stream={sid}"); client.Dispose(); return; }
+            catch (OperationCanceledException)
+            {
+                Log($"OPEN timeout stream={sid}");
+                CloseStream(state);
+                return;
+            }
             finally { _pendingOpens.TryRemove(sid, out _); }
 
-            var (type, _, _, payload) = Protocol.Decode(resp);
+            var (type, _, _, _) = Protocol.Decode(resp);
             if (type == Protocol.MsgOpenFail)
             {
                 Log($"OPEN rejected stream={sid}");
-                client.Dispose();
+                CloseStream(state);
                 return;
             }
 
-            // Stream open — register and start forwarding
-            _streams[sid] = state;
+            state.OpenConfirmed = true;
             Log($"Stream opened stream={sid} remote={remote}");
 
-            await TcpReadLoopAsync(state, ct);
+            // Now forward outbound data (local→peer). Inbound data (peer→local)
+            // is already being delivered by the writer task we started above.
+            await TcpReadLoopAsync(state, linkedCts.Token);
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex) { Log($"Stream {sid} error: {ex.Message}"); }
         finally
         {
-            if (!state.Closed)
+            // Local TCP read loop has ended (either local EOF or error).
+            state.LocalReadEnded = true;
+
+            // Send FIN to peer so the peer's writer can drain and half-close
+            // its end. Skip if stream never opened or already closed.
+            if (!state.Closed && state.OpenConfirmed)
             {
-                // Send FIN
-                _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgFin, sid, NextSeq(sid)));
+                try
+                {
+                    _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgFin, sid, NextSeq(sid)));
+                }
+                catch { }
             }
-            CloseStream(state);
+
+            // If the peer has also FIN'd (or stream never opened), close fully.
+            // Otherwise leave the stream half-open so the writer task can
+            // continue delivering peer→local DATA until peer sends FIN.
+            if (state.RemoteWriteEnded || !state.OpenConfirmed)
+            {
+                CloseStream(state);
+            }
+            else
+            {
+                // Half-close: shut down local TCP receive side so the OS stops
+                // buffering further local-app sends (we won't read them).
+                try { state.Client.Client.Shutdown(SocketShutdown.Receive); } catch { }
+                // Stream stays in _streams until writer task observes FIN and
+                // closes it.
+            }
         }
     }
 
