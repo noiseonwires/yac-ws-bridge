@@ -18,6 +18,7 @@ public partial class MainPage : ContentPage
         BindingContext = this;
         _tunnel = tunnel;
         _tunnel.OnLog += OnTunnelLog;
+        _tunnel.OnProbeStatusChanged += OnProbeStatusChanged;
 
         // Load saved settings
         BridgeUrlEntry.Text = Preferences.Default.Get("BridgeUrl", "wss://");
@@ -187,6 +188,54 @@ public partial class MainPage : ContentPage
     private void OnTunnelLog(string line)
     {
         MainThread.BeginInvokeOnMainThread(() => AddLog(line));
+    }
+
+    /// <summary>
+    /// Updates the probe status pill below the Connect button. Called from
+    /// arbitrary threads — marshals to the UI thread itself.
+    /// </summary>
+    private void OnProbeStatusChanged(ProbeStatus status, string detail)
+    {
+        // Diagnostic: confirm we actually receive the event (we have seen
+        // cases where the probe runs but the UI doesn't update).
+        MainThread.BeginInvokeOnMainThread(() => AddLog($"[ui] probe status -> {status}: {detail}"));
+
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            switch (status)
+            {
+                case ProbeStatus.Idle:
+                    ProbeStatusBorder.IsVisible = false;
+                    return;
+
+                case ProbeStatus.Testing:
+                    ProbeStatusBorder.IsVisible = true;
+                    ProbeStatusBorder.BackgroundColor = Color.FromArgb("#FFF3CD"); // amber
+                    ProbeStatusIcon.TextColor   = Color.FromArgb("#856404");
+                    ProbeStatusLabel.TextColor  = Color.FromArgb("#856404");
+                    ProbeStatusIcon.Text  = "⧗"; // hourglass-ish dot
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Testing connection..." : detail;
+                    return;
+
+                case ProbeStatus.Ok:
+                    ProbeStatusBorder.IsVisible = true;
+                    ProbeStatusBorder.BackgroundColor = Color.FromArgb("#2E7D32"); // vivid green
+                    ProbeStatusIcon.TextColor   = Color.FromArgb("#FFFFFF");
+                    ProbeStatusLabel.TextColor  = Color.FromArgb("#FFFFFF");
+                    ProbeStatusIcon.Text  = "✓";
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Connection verified" : detail;
+                    return;
+
+                case ProbeStatus.Failed:
+                    ProbeStatusBorder.IsVisible = true;
+                    ProbeStatusBorder.BackgroundColor = Color.FromArgb("#F8D7DA"); // red
+                    ProbeStatusIcon.TextColor   = Color.FromArgb("#721C24");
+                    ProbeStatusLabel.TextColor  = Color.FromArgb("#721C24");
+                    ProbeStatusIcon.Text  = "✕";
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Connection test failed" : detail;
+                    return;
+            }
+        });
     }
 
     private void AddLog(string line)

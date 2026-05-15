@@ -7,6 +7,23 @@ using System.Threading.Channels;
 namespace BridgeToFreedom.Services;
 
 /// <summary>
+/// Outcome of the helper→adapter end-to-end connectivity probe shown in the
+/// UI as a status indicator. The probe is fired automatically once the
+/// upstream is ready (per upstream cycle).
+/// </summary>
+public enum ProbeStatus
+{
+    /// <summary>Not yet attempted, or reset after disconnect.</summary>
+    Idle,
+    /// <summary>Probe in progress (one or more attempts).</summary>
+    Testing,
+    /// <summary>Probe completed successfully — wsApi bidirectional data path verified.</summary>
+    Ok,
+    /// <summary>All probe attempts failed.</summary>
+    Failed,
+}
+
+/// <summary>
 /// Core tunnel service matching the Go helper logic.
 /// Manages upstream WS, TCP listener, stream multiplexing, and wsSend via YC gRPC API (or relay).
 /// </summary>
@@ -14,6 +31,14 @@ public sealed class TunnelService : IDisposable
 {
     public event Action<string>? OnLog;
     public event Action? OnStopped;
+
+    /// <summary>
+    /// Fires when the connectivity-probe status changes. <c>detail</c> is a
+    /// short human-readable message suitable for the status indicator (RTT
+    /// on success, last error or attempt count on failure / in progress).
+    /// Always invoked on a thread-pool thread — marshal to the UI yourself.
+    /// </summary>
+    public event Action<ProbeStatus, string>? OnProbeStatusChanged;
 
     private CancellationTokenSource? _cts;
     private volatile bool _stopping;
@@ -38,6 +63,18 @@ public sealed class TunnelService : IDisposable
     private readonly ConcurrentDictionary<uint, StreamState> _streams = new();
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pendingOpens = new();
     private readonly ConcurrentDictionary<uint, uint> _streamSeqs = new();
+
+    // Per-active-probe inbound DATA/FIN/RST channel, keyed by the probe's
+    // stream ID (which has the PROBE bit set). The probe goroutine drains the
+    // channel; HandleFrame routes frames here instead of through the regular
+    // _streams dispatch (no TcpClient is registered for a probe stream).
+    private readonly ConcurrentDictionary<uint, Channel<(byte type, byte[] payload)>> _probeChannels = new();
+
+    // Set to true once a connectivity probe has been launched for the current
+    // upstream cycle. Reset to false on upstream disconnect so the next
+    // successful HELLO_OK fires a fresh probe (lets the user verify the wsApi
+    // data path after every reconnect).
+    private volatile bool _probeRanThisCycle;
 
     // Config
     public string BridgeUrl { get; set; } = "";
@@ -120,6 +157,8 @@ public sealed class TunnelService : IDisposable
         _nextStreamId = 1;
         _helperShortId = 0;
         _upstreamReady = false;
+        _probeRanThisCycle = false;
+        EmitProbeStatus(ProbeStatus.Idle, "");
         var ct = _cts.Token;
 
         Log("Starting tunnel service...");
@@ -248,6 +287,28 @@ public sealed class TunnelService : IDisposable
                 // Start listener if not already running
                 EnsureListenerRunning(ct);
 
+                // DIAG: prove we reach this point and show flag value.
+                Log($"[diag] post-listener; probeRan={_probeRanThisCycle} ready={_upstreamReady} peerEmpty={string.IsNullOrEmpty(_peerConnId)}");
+
+                // Kick off a one-shot connectivity probe so the user can
+                // verify the wsApi bidirectional data path is actually
+                // working, independently of whether the adapter's configured
+                // target is reachable.
+                if (!_probeRanThisCycle)
+                {
+                    _probeRanThisCycle = true;
+                    Log("Launching connectivity probe...");
+                    _ = Task.Run(async () =>
+                    {
+                        try { await RunProbeAsync(ct); }
+                        catch (Exception ex)
+                        {
+                            Log($"Probe crashed: {ex.GetType().Name}: {ex.Message}");
+                            EmitProbeStatus(ProbeStatus.Failed, $"crashed: {ex.GetType().Name}");
+                        }
+                    }, ct);
+                }
+
                 // Start ping loop and read loop
                 using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 var pingTask = PingLoopAsync(pingCts.Token);
@@ -267,6 +328,8 @@ public sealed class TunnelService : IDisposable
             _peerConnId = "";
             _iamToken = "";
             _helperShortId = 0;
+            _probeRanThisCycle = false;
+            EmitProbeStatus(ProbeStatus.Idle, "");
             CloseAllStreams();
 
             if (ct.IsCancellationRequested) return;
@@ -351,6 +414,21 @@ public sealed class TunnelService : IDisposable
                 case Protocol.MsgData:
                 case Protocol.MsgFin:
                 case Protocol.MsgRst:
+                    // Probe streams aren't registered in _streams; they have
+                    // their own pendingOpens entry (for OPEN_OK/FAIL) and a
+                    // dedicated DATA/FIN/RST channel drained by RunProbeAsync.
+                    if (Protocol.IsProbe(streamId))
+                    {
+                        if (type == Protocol.MsgOpenOK || type == Protocol.MsgOpenFail)
+                        {
+                            if (_pendingOpens.TryRemove(streamId, out var probeTcs))
+                                probeTcs.TrySetResult(data);
+                            return;
+                        }
+                        if (_probeChannels.TryGetValue(streamId, out var pch))
+                            pch.Writer.TryWrite((type, payload));
+                        return;
+                    }
                     if (!_streams.TryGetValue(streamId, out var s))
                     {
                         // OPEN_OK/OPEN_FAIL fallback for legacy code paths: try the pendingOpens
@@ -603,9 +681,10 @@ public sealed class TunnelService : IDisposable
         // In multi-helper mode the cloud function assigns this helper a 1-byte
         // shortId via HELLO_OK; we stamp it into the top byte of streamID so
         // the adapter can route per-stream frames back to us. shortId==0
-        // means single-helper / legacy deployment.
-        var local = (Interlocked.Increment(ref _nextStreamId) - 1) & 0x00FFFFFFu;
-        var sid = ((uint)_helperShortId << 24) | local;
+        // means single-helper / legacy deployment. The local ID is 23 bits
+        // (top bit is the PROBE flag, reserved for synthetic probe streams).
+        var local = (Interlocked.Increment(ref _nextStreamId) - 1) & Protocol.StreamLocalIDMask;
+        var sid = ((uint)_helperShortId << Protocol.StreamHelperShortIDShift) | local;
         if (_helperShortId != 0)
             Log($"New connection remote={remote} stream={sid} (shortId={_helperShortId} local={local})");
         else
@@ -848,6 +927,225 @@ public sealed class TunnelService : IDisposable
         // Log diagnostics on failure
         Log($"WaitForReady failed: upstreamReady={_upstreamReady} peerConnId={(_peerConnId != "" ? "set" : "empty")} relay={Relay}");
         return false;
+    }
+
+    // --- Connectivity probe ---
+
+    /// <summary>How many probe attempts to make before giving up.</summary>
+    private const int ProbeMaxAttempts = 3;
+    /// <summary>Delay between probe attempts.</summary>
+    private static readonly TimeSpan ProbeRetryDelay = TimeSpan.FromSeconds(3);
+
+    private void EmitProbeStatus(ProbeStatus status, string detail)
+    {
+        try { OnProbeStatusChanged?.Invoke(status, detail); }
+        catch { /* never let UI exceptions kill the tunnel */ }
+    }
+
+    /// <summary>
+    /// Drives the end-to-end connectivity probe with retries. Emits
+    /// <see cref="ProbeStatus.Testing"/> while running, then
+    /// <see cref="ProbeStatus.Ok"/> on success or
+    /// <see cref="ProbeStatus.Failed"/> if all attempts are exhausted.
+    /// </summary>
+    private async Task RunProbeAsync(CancellationToken ct)
+    {
+        Log($"Probe: entered (relay={Relay}, helperShortId={_helperShortId}, peer={(_peerConnId != "" ? "set" : "empty")})");
+        EmitProbeStatus(ProbeStatus.Testing, $"Testing connection... (1/{ProbeMaxAttempts})");
+
+        string lastError = "";
+        for (int attempt = 1; attempt <= ProbeMaxAttempts && !ct.IsCancellationRequested; attempt++)
+        {
+            if (attempt > 1)
+            {
+                EmitProbeStatus(ProbeStatus.Testing,
+                    $"Retrying... ({attempt}/{ProbeMaxAttempts}) — last: {lastError}");
+                try { await Task.Delay(ProbeRetryDelay, ct); }
+                catch (OperationCanceledException) { return; }
+            }
+
+            var (ok, detail) = await TryProbeOnceAsync(attempt, ct);
+            if (ct.IsCancellationRequested) return;
+
+            if (ok)
+            {
+                EmitProbeStatus(ProbeStatus.Ok, detail);
+                return;
+            }
+            lastError = detail;
+        }
+
+        if (!ct.IsCancellationRequested)
+        {
+            EmitProbeStatus(ProbeStatus.Failed,
+                $"Connection test failed after {ProbeMaxAttempts} attempts: {lastError}");
+        }
+    }
+
+    /// <summary>
+    /// Single probe attempt. Returns (true, "rtt=…") on success, otherwise
+    /// (false, "&lt;reason&gt;"). Does not modify probe status; the caller
+    /// (<see cref="RunProbeAsync"/>) aggregates attempts and decides when
+    /// to flip to Ok / Failed.
+    /// </summary>
+    private async Task<(bool ok, string detail)> TryProbeOnceAsync(int attempt, CancellationToken ct)
+    {
+        // Wait for upstream readiness; in non-relay mode also wait for peer
+        // (i.e. an adapter to have joined this bridge). We deliberately keep
+        // this short — if the adapter isn't up we want to fail fast and let
+        // the retry loop emit a clearer status, not hang the UI for 20s.
+        var waitTimeout = TimeSpan.FromSeconds(7);
+        using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        waitCts.CancelAfter(waitTimeout);
+        try
+        {
+            while (!waitCts.IsCancellationRequested)
+            {
+                bool ready = _upstreamReady && (Relay || !string.IsNullOrEmpty(_peerConnId));
+                if (ready) break;
+                await Task.Delay(200, waitCts.Token);
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Distinguish the two failure modes so the UI message is
+            // actionable. "Upstream not ready" really means the WebSocket
+            // to the cloud isn't open yet; "adapter not connected" means
+            // we're authenticated with the cloud but no helper-peer
+            // (adapter) is currently registered on the other end.
+            if (!_upstreamReady)
+            {
+                Log($"Probe attempt {attempt}: upstream not ready within {waitTimeout.TotalSeconds:F0}s");
+                return (false, "upstream not ready");
+            }
+            Log($"Probe attempt {attempt}: adapter not connected within {waitTimeout.TotalSeconds:F0}s");
+            return (false, "adapter not connected");
+        }
+        catch (OperationCanceledException) { return (false, "cancelled"); }
+
+        if (ct.IsCancellationRequested) return (false, "cancelled");
+
+        // Allocate a probe-flagged stream ID.
+        var local = (Interlocked.Increment(ref _nextStreamId) - 1) & Protocol.StreamLocalIDMask;
+        var sid = ((uint)_helperShortId << Protocol.StreamHelperShortIDShift)
+                  | Protocol.StreamProbeFlag
+                  | local;
+
+        var openTcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dataChan = Channel.CreateUnbounded<(byte type, byte[] payload)>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+        });
+
+        _pendingOpens[sid] = openTcs;
+        _probeChannels[sid] = dataChan;
+
+        try
+        {
+            var startUtc = DateTime.UtcNow;
+            Log($"Probe attempt {attempt}: sending OPEN stream={sid} (shortId={_helperShortId}, PROBE=1)");
+
+            var openErr = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid));
+            if (openErr != null)
+            {
+                Log($"Probe attempt {attempt}: OPEN send failed: {openErr}");
+                return (false, $"send failed: {openErr}");
+            }
+
+            // Wait for OPEN_OK.
+            byte[] resp;
+            using (var openTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                openTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+                using var reg = openTimeout.Token.Register(() => openTcs.TrySetCanceled());
+                try
+                {
+                    resp = await openTcs.Task.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    Log($"Probe attempt {attempt}: OPEN_OK timeout stream={sid} (10s)");
+                    return (false, "OPEN_OK timeout");
+                }
+                catch (OperationCanceledException) { return (false, "cancelled"); }
+            }
+
+            var (rType, _, _, rPayload) = Protocol.Decode(resp);
+            if (rType == Protocol.MsgOpenFail)
+            {
+                var reason = System.Text.Encoding.UTF8.GetString(rPayload);
+                Log($"Probe attempt {attempt}: OPEN_FAIL stream={sid} reason={reason}");
+                return (false, $"OPEN_FAIL: {reason}");
+            }
+            Log($"Probe attempt {attempt}: OPEN_OK stream={sid} rtt={(DateTime.UtcNow - startUtc).TotalMilliseconds:F0}ms");
+
+            // Send a token GET so this looks like a real HTTP request on the wire.
+            var getReq = System.Text.Encoding.ASCII.GetBytes(
+                "GET / HTTP/1.0\r\nHost: probe.bridge-to-freedom\r\nUser-Agent: btf-maui-probe\r\n\r\n");
+            var dataErr = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, sid, payload: getReq));
+            if (dataErr != null)
+            {
+                Log($"Probe attempt {attempt}: GET send failed: {dataErr}");
+                return (false, $"GET send failed: {dataErr}");
+            }
+
+            // Read response until FIN/RST or timeout.
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            readCts.CancelAfter(TimeSpan.FromSeconds(10));
+            var body = new List<byte>(256);
+            try
+            {
+                while (await dataChan.Reader.WaitToReadAsync(readCts.Token))
+                {
+                    while (dataChan.Reader.TryRead(out var item))
+                    {
+                        switch (item.type)
+                        {
+                            case Protocol.MsgData:
+                                body.AddRange(item.payload);
+                                break;
+                            case Protocol.MsgFin:
+                                goto done;
+                            case Protocol.MsgRst:
+                                Log($"Probe attempt {attempt}: RST stream={sid} after {body.Count} bytes");
+                                return (false, "RST received");
+                        }
+                    }
+                }
+            done:;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                Log($"Probe attempt {attempt}: response timeout stream={sid} after {body.Count} bytes (no FIN in 10s)");
+                return (false, "response timeout");
+            }
+            catch (OperationCanceledException) { return (false, "cancelled"); }
+
+            var totalMs = (DateTime.UtcNow - startUtc).TotalMilliseconds;
+            if (body.Count == 0)
+            {
+                Log($"Probe attempt {attempt}: empty response stream={sid} rtt={totalMs:F0}ms");
+                return (false, "empty response");
+            }
+            const string expected = "HTTP/1.1 200 OK";
+            var bodyText = System.Text.Encoding.ASCII.GetString(body.ToArray());
+            if (bodyText.StartsWith(expected, StringComparison.Ordinal))
+            {
+                var msg = $"OK — verified ({totalMs:F0} ms)";
+                Log($"Probe attempt {attempt}: OK stream={sid} rtt={totalMs:F0}ms bytes={body.Count}");
+                return (true, msg);
+            }
+            var preview = bodyText.Length > 60 ? bodyText.Substring(0, 60) + "..." : bodyText;
+            Log($"Probe attempt {attempt}: unexpected response stream={sid} rtt={totalMs:F0}ms bytes={body.Count} preview={preview}");
+            return (false, "unexpected response");
+        }
+        finally
+        {
+            _pendingOpens.TryRemove(sid, out _);
+            _probeChannels.TryRemove(sid, out _);
+            try { dataChan.Writer.TryComplete(); } catch { }
+        }
     }
 
     // --- Send to peer ---

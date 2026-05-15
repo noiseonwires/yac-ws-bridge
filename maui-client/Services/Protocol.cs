@@ -27,6 +27,19 @@ public static class Protocol
     public const byte MsgFin      = 0x21;
     public const byte MsgRst      = 0x22;
 
+    // Stream-ID layout (uint32, big-endian on the wire):
+    //   bits 31..24  helperShortID (1..255; 0 = unassigned / legacy)
+    //   bit  23      PROBE flag (1 = synthetic end-to-end-connectivity probe)
+    //   bits 22..0   localID (helper-side allocator, ~8.4 M values per helper)
+    // The adapter recognises StreamProbeFlag on OPEN and synthesises an
+    // HTTP/1.1 200 OK response without dialling its configured target.
+    public const int  StreamHelperShortIDShift = 24;
+    public const uint StreamProbeFlag          = 0x00800000u;
+    public const uint StreamLocalIDMask        = 0x007FFFFFu;
+
+    public static bool IsProbe(uint streamId) => (streamId & StreamProbeFlag) != 0;
+    public static byte HelperShortIdOf(uint streamId) => (byte)(streamId >> StreamHelperShortIDShift);
+
     public static string MsgName(byte type) => type switch
     {
         MsgHello    => "HELLO",

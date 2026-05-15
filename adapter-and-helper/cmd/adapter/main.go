@@ -124,6 +124,17 @@ func main() {
 					map[byte]string{protocol.MsgOpen: "OPEN", protocol.MsgFin: "FIN", protocol.MsgRst: "RST"}[f.Type],
 					f.StreamID, f.SeqID)
 			}
+			// Probe streams are entirely synthetic on the adapter side: we never
+			// register a Stream, never dial a target, and we don't care about
+			// in-order delivery of the helper's GET/FIN — so skip the reorder
+			// machinery (which would otherwise leak a buffer entry per probe).
+			if protocol.IsProbe(f.StreamID) {
+				if f.Type == protocol.MsgOpen {
+					go handleProbe(sm, f.StreamID)
+				}
+				// DATA/FIN/RST from the helper for this probe are silently absorbed.
+				return
+			}
 			sm.HandleStreamFrame(f, func(of protocol.Frame) {
 				switch of.Type {
 				case protocol.MsgOpen:
@@ -245,4 +256,40 @@ func handleOpen(cfg *config.Config, sm *streams.Manager, streamID uint32) {
 
 	log.Printf("[INFO] stream opened stream=%d target=%s", streamID, cfg.Target.Address)
 	sm.ReadLoop(s)
+}
+
+// handleProbe synthesises an HTTP/1.1 200 OK response without dialling any
+// target. Triggered by an OPEN whose streamID has the PROBE bit set (see
+// protocol.StreamProbeFlag). The probe round-trip exercises the full wsApi
+// data path — helper → wsApi → adapter and adapter → wsApi → helper — so
+// the helper can confirm bidirectional connectivity is actually working,
+// independently of whether the adapter's configured target is reachable.
+func handleProbe(sm *streams.Manager, streamID uint32) {
+	log.Printf("[INFO] probe stream=%d: synthesising HTTP 200 OK (no target dial)", streamID)
+
+	if err := sm.SendFrame(protocol.Frame{Type: protocol.MsgOpenOK, StreamID: streamID}); err != nil {
+		log.Printf("[WARN] probe OPEN_OK send failed stream=%d: %v", streamID, err)
+		return
+	}
+
+	body := "HTTP/1.1 200 OK\r\n" +
+		"Server: bridge-to-freedom-adapter\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"Content-Length: 2\r\n" +
+		"Connection: close\r\n" +
+		"\r\n" +
+		"OK"
+	if err := sm.SendFrame(protocol.Frame{
+		Type:     protocol.MsgData,
+		StreamID: streamID,
+		Payload:  []byte(body),
+	}); err != nil {
+		log.Printf("[WARN] probe DATA send failed stream=%d: %v", streamID, err)
+		return
+	}
+	if err := sm.SendFrame(protocol.Frame{Type: protocol.MsgFin, StreamID: streamID}); err != nil {
+		log.Printf("[WARN] probe FIN send failed stream=%d: %v", streamID, err)
+		return
+	}
+	log.Printf("[INFO] probe stream=%d: response sent (%d bytes)", streamID, len(body))
 }

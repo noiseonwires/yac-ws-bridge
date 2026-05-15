@@ -92,6 +92,32 @@
                         Clicked="OnConnectClicked"
                         BackgroundColor="{AppThemeBinding Light=#512BD4, Dark=#7B5FD4}"
                         TextColor="White" />
+
+                <!-- Probe status indicator: shows the result of the end-to-end
+                     wsApi connectivity probe (helper→cloud→adapter→helper).
+                     Hidden when idle; colored pill while testing / on result. -->
+                <Border x:Name="ProbeStatusBorder"
+                        IsVisible="False"
+                        StrokeShape="RoundRectangle 8"
+                        StrokeThickness="0"
+                        Padding="12,8"
+                        BackgroundColor="#FFF3CD">
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10" VerticalOptions="Center">
+                        <Label x:Name="ProbeStatusIcon"
+                               Grid.Column="0"
+                               Text="●"
+                               FontSize="18"
+                               VerticalOptions="Center"
+                               TextColor="#856404" />
+                        <Label x:Name="ProbeStatusLabel"
+                               Grid.Column="1"
+                               Text=""
+                               FontSize="13"
+                               VerticalOptions="Center"
+                               LineBreakMode="WordWrap"
+                               TextColor="#856404" />
+                    </Grid>
+                </Border>
             </VerticalStackLayout>
         </Border>
 
