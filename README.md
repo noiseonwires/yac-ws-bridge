@@ -296,6 +296,64 @@ yc resource-manager folder add-access-binding $FOLDER_ID \
 
 ### 2. Create and deploy the Serverless Function
 
+#### Obfuscate `index.js` first (strongly recommended)
+
+Before packaging, run `index.js` through a JavaScript obfuscator. The point is to make it harder for Yandex Cloud itself to spot the function as a censorship-bypass bridge and ban it — the plain source has very recognisable identifiers (`adapterConnId`, `helperConnId`, the route switch, etc.) and would light up any automated scan of uploaded function code.
+
+Using [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator):
+
+```bash
+npm install -g javascript-obfuscator
+
+cd bridge-cloud
+cp index.js index.original.js   # keep a clean copy outside the zip
+javascript-obfuscator index.original.js \
+  --output index.js \
+  --compact true \
+  --control-flow-flattening true \
+  --control-flow-flattening-threshold 0.75 \
+  --dead-code-injection true \
+  --dead-code-injection-threshold 0.4 \
+  --string-array true \
+  --string-array-encoding base64 \
+  --string-array-threshold 0.8 \
+  --identifier-names-generator hexadecimal \
+  --rename-globals false \
+  --self-defending true \
+  --target node
+```
+
+Windows (PowerShell) — the same flags, just line-continued differently:
+
+```powershell
+npm install -g javascript-obfuscator
+
+cd bridge-cloud
+Copy-Item index.js index.original.js
+javascript-obfuscator index.original.js `
+  --output index.js `
+  --compact true `
+  --control-flow-flattening true `
+  --control-flow-flattening-threshold 0.75 `
+  --dead-code-injection true `
+  --dead-code-injection-threshold 0.4 `
+  --string-array true `
+  --string-array-encoding base64 `
+  --string-array-threshold 0.8 `
+  --identifier-names-generator hexadecimal `
+  --rename-globals false `
+  --self-defending true `
+  --target node
+```
+
+Notes:
+
+- Keep `--rename-globals false` and `--target node` — the YC runtime calls `exports.handler`, so the exported entrypoint name must stay intact.
+- `--self-defending` makes the obfuscated code brittle if reformatted; do **not** re-edit `index.js` after obfuscation. Edit `index.original.js` and re-run the obfuscator.
+- Running the obfuscator twice (output of pass 1 as input of pass 2) is fine and a bit more thorough, but slows cold start.
+
+#### Package and deploy
+
 ```bash
 cd bridge-cloud
 zip -r bridge-function.zip index.js package.json

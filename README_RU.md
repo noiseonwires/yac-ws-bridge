@@ -289,6 +289,40 @@ yc resource-manager folder add-access-binding $FOLDER_ID \
 
 ### 2. Создание и деплой Serverless Function
 
+#### Сначала обфусцируйте `index.js` (настоятельно рекомендуется)
+
+Перед упаковкой прогоните `index.js` через JS-обфускатор. Смысл — затруднить самому Yandex Cloud опознать функцию как «мост для обхода блокировок» и забанить её — в обычном исходнике слишком узнаваемые идентификаторы (`adapterConnId`, `helperConnId`, switch по route и т.д.), которые засветятся любым автоматическим сканом залитого кода функции.
+
+Через [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator):
+
+```bash
+npm install -g javascript-obfuscator
+
+cd bridge-cloud
+cp index.js index.original.js   # сохраняем чистую копию вне zip
+javascript-obfuscator index.original.js \
+  --output index.js \
+  --compact true \
+  --control-flow-flattening true \
+  --control-flow-flattening-threshold 0.75 \
+  --dead-code-injection true \
+  --dead-code-injection-threshold 0.4 \
+  --string-array true \
+  --string-array-encoding base64 \
+  --string-array-threshold 0.8 \
+  --identifier-names-generator hexadecimal \
+  --rename-globals false \
+  --self-defending true \
+  --target node
+```
+Замечания:
+
+- Оставьте `--rename-globals false` и `--target node` — YC-рантайм вызывает `exports.handler`, имя экспортируемого entrypoint должно остаться неизменным.
+- `--self-defending` делает обфусцированный код хрупким при переформатировании; **не** редактируйте `index.js` после обфускации. Правьте `index.original.js` и перезапускайте обфускатор.
+- Прогон обфускатора дважды (выход первого прохода — вход второго) допустим и чуть тщательнее, но замедляет холодный старт.
+
+#### Упаковка и деплой
+
 ```bash
 cd bridge-cloud
 zip -r bridge-function.zip index.js package.json
