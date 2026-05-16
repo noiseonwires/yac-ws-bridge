@@ -293,7 +293,21 @@ yc resource-manager folder add-access-binding $FOLDER_ID \
 
 Перед упаковкой прогоните `index.js` через JS-обфускатор. Смысл — затруднить самому Yandex Cloud опознать функцию как «мост для обхода блокировок» и забанить её — в обычном исходнике слишком узнаваемые идентификаторы (`adapterConnId`, `helperConnId`, switch по route и т.д.), которые засветятся любым автоматическим сканом залитого кода функции.
 
-Через [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator):
+Чтобы выкинуть и логи из бандла, предварительно вырежьте их из исходника перед обфускацией. Сначала сделайте рабочую копию исходника:
+
+```bash
+cd bridge-cloud
+cp index.js index.original.js   # сохраняем чистую копию вне zip
+```
+
+Затем вырежьте console-вызовы из `index.original.js`:
+
+```bash
+# выкидываем все строки, в которых единственная инструкция — это console.*
+sed -i.bak -E '/^[[:space:]]*console\.(log|warn|error|info|debug|trace)\(.*\);?[[:space:]]*$/d' index.original.js
+```
+
+Через [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator) (шаг `cp` пропускаем, если уже сделали выше):
 
 ```bash
 npm install -g javascript-obfuscator
@@ -313,6 +327,7 @@ javascript-obfuscator index.original.js \
   --identifier-names-generator hexadecimal \
   --rename-globals false \
   --self-defending true \
+  --disable-console-output true \
   --target node
 ```
 Замечания:
@@ -369,15 +384,6 @@ sed -i.bak \
   spec.yaml
 ```
 
-На Windows (PowerShell):
-
-```powershell
-(Get-Content spec.yaml -Raw) `
-  -replace '\$\{FUNCTION_ID\}',        $env:FUNCTION_ID `
-  -replace '\$\{SERVICE_ACCOUNT_ID\}', $env:SA_ID `
-  | Set-Content spec.yaml -NoNewline
-```
-
 Заодно это удобный момент, чтобы переименовать ключи WebSocket-путей со стандартных (`/_adapter`, `/_helper`) на что-нибудь неузнаваемое — см. [Кастомизация путей эндпоинтов](#кастомизация-путей-эндпоинтов). Например, чтобы переименовать их в `/q7x` и `/k2m`:
 
 ```bash
@@ -385,15 +391,6 @@ sed -i.bak \
   -e 's|^  /_adapter:|  /q7x:|' \
   -e 's|^  /_helper:|  /k2m:|' \
   spec.yaml
-```
-
-PowerShell-эквивалент:
-
-```powershell
-(Get-Content spec.yaml) `
-  -replace '^(\s*)/_adapter:', '$1/q7x:' `
-  -replace '^(\s*)/_helper:',  '$1/k2m:' `
-  | Set-Content spec.yaml
 ```
 
 Затем создайте gateway:

@@ -300,7 +300,21 @@ yc resource-manager folder add-access-binding $FOLDER_ID \
 
 Before packaging, run `index.js` through a JavaScript obfuscator. The point is to make it harder for Yandex Cloud itself to spot the function as a censorship-bypass bridge and ban it — the plain source has very recognisable identifiers (`adapterConnId`, `helperConnId`, the route switch, etc.) and would light up any automated scan of uploaded function code.
 
-Using [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator):
+To remove log strings from the bundle, pre-strip them before obfuscation. First make a working copy of the source:
+
+```bash
+cd bridge-cloud
+cp index.js index.original.js
+```
+
+Then drop the console calls from `index.original.js`:
+
+```bash
+# drop every line whose only statement is a console.* call
+sed -i.bak -E '/^[[:space:]]*console\.(log|warn|error|info|debug|trace)\(.*\);?[[:space:]]*$/d' index.original.js
+```
+
+Using [`javascript-obfuscator`](https://github.com/javascript-obfuscator/javascript-obfuscator) (skip the `cp` line inside the block if you already did it above):
 
 ```bash
 npm install -g javascript-obfuscator
@@ -320,29 +334,7 @@ javascript-obfuscator index.original.js \
   --identifier-names-generator hexadecimal \
   --rename-globals false \
   --self-defending true \
-  --target node
-```
-
-Windows (PowerShell) — the same flags, just line-continued differently:
-
-```powershell
-npm install -g javascript-obfuscator
-
-cd bridge-cloud
-Copy-Item index.js index.original.js
-javascript-obfuscator index.original.js `
-  --output index.js `
-  --compact true `
-  --control-flow-flattening true `
-  --control-flow-flattening-threshold 0.75 `
-  --dead-code-injection true `
-  --dead-code-injection-threshold 0.4 `
-  --string-array true `
-  --string-array-encoding base64 `
-  --string-array-threshold 0.8 `
-  --identifier-names-generator hexadecimal `
-  --rename-globals false `
-  --self-defending true `
+  --disable-console-output true \
   --target node
 ```
 
@@ -400,15 +392,6 @@ sed -i.bak \
   spec.yaml
 ```
 
-On Windows (PowerShell):
-
-```powershell
-(Get-Content spec.yaml -Raw) `
-  -replace '\$\{FUNCTION_ID\}',        $env:FUNCTION_ID `
-  -replace '\$\{SERVICE_ACCOUNT_ID\}', $env:SA_ID `
-  | Set-Content spec.yaml -NoNewline
-```
-
 While you're here, this is also a good moment to rename the WebSocket path keys from the defaults (`/_adapter`, `/_helper`) to something non-fingerprintable — see [Customizing endpoint paths](#customizing-endpoint-paths). For example, to rename them to `/q7x` and `/k2m`:
 
 ```bash
@@ -416,15 +399,6 @@ sed -i.bak \
   -e 's|^  /_adapter:|  /q7x:|' \
   -e 's|^  /_helper:|  /k2m:|' \
   spec.yaml
-```
-
-PowerShell equivalent:
-
-```powershell
-(Get-Content spec.yaml) `
-  -replace '^(\s*)/_adapter:', '$1/q7x:' `
-  -replace '^(\s*)/_helper:',  '$1/k2m:' `
-  | Set-Content spec.yaml
 ```
 
 If you go this route, update `bridge.url` in both `adapter.config.yaml` and `helper.config.yaml` to use the new paths.
