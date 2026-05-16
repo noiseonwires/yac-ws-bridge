@@ -333,6 +333,44 @@ Edit `bridge-cloud/spec.yaml` — replace the two placeholders:
 - `${FUNCTION_ID}` — the function ID from step 2
 - `${SERVICE_ACCOUNT_ID}` — the service account ID from step 1
 
+You can do this in one shot with `sed` (Linux/macOS), assuming `$FUNCTION_ID` and `$SA_ID` are exported from the previous steps:
+
+```bash
+sed -i.bak \
+  -e "s|\${FUNCTION_ID}|$FUNCTION_ID|g" \
+  -e "s|\${SERVICE_ACCOUNT_ID}|$SA_ID|g" \
+  spec.yaml
+```
+
+On Windows (PowerShell):
+
+```powershell
+(Get-Content spec.yaml -Raw) `
+  -replace '\$\{FUNCTION_ID\}',        $env:FUNCTION_ID `
+  -replace '\$\{SERVICE_ACCOUNT_ID\}', $env:SA_ID `
+  | Set-Content spec.yaml -NoNewline
+```
+
+While you're here, this is also a good moment to rename the WebSocket path keys from the defaults (`/_adapter`, `/_helper`) to something non-fingerprintable — see [Customizing endpoint paths](#customizing-endpoint-paths). For example, to rename them to `/q7x` and `/k2m`:
+
+```bash
+sed -i.bak \
+  -e 's|^  /_adapter:|  /q7x:|' \
+  -e 's|^  /_helper:|  /k2m:|' \
+  spec.yaml
+```
+
+PowerShell equivalent:
+
+```powershell
+(Get-Content spec.yaml) `
+  -replace '^(\s*)/_adapter:', '$1/q7x:' `
+  -replace '^(\s*)/_helper:',  '$1/k2m:' `
+  | Set-Content spec.yaml
+```
+
+If you go this route, update `bridge.url` in both `adapter.config.yaml` and `helper.config.yaml` to use the new paths.
+
 Then create the gateway:
 
 ```bash

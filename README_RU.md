@@ -326,6 +326,42 @@ yc serverless function version create \
 - `${FUNCTION_ID}` — ID функции из шага 2
 - `${SERVICE_ACCOUNT_ID}` — ID сервисного аккаунта из шага 1
 
+Это можно сделать одной командой через `sed` (Linux/macOS), предполагая, что `$FUNCTION_ID` и `$SA_ID` экспортированы из предыдущих шагов:
+
+```bash
+sed -i.bak \
+  -e "s|\${FUNCTION_ID}|$FUNCTION_ID|g" \
+  -e "s|\${SERVICE_ACCOUNT_ID}|$SA_ID|g" \
+  spec.yaml
+```
+
+На Windows (PowerShell):
+
+```powershell
+(Get-Content spec.yaml -Raw) `
+  -replace '\$\{FUNCTION_ID\}',        $env:FUNCTION_ID `
+  -replace '\$\{SERVICE_ACCOUNT_ID\}', $env:SA_ID `
+  | Set-Content spec.yaml -NoNewline
+```
+
+Заодно это удобный момент, чтобы переименовать ключи WebSocket-путей со стандартных (`/_adapter`, `/_helper`) на что-нибудь неузнаваемое — см. [Кастомизация путей эндпоинтов](#кастомизация-путей-эндпоинтов). Например, чтобы переименовать их в `/q7x` и `/k2m`:
+
+```bash
+sed -i.bak \
+  -e 's|^  /_adapter:|  /q7x:|' \
+  -e 's|^  /_helper:|  /k2m:|' \
+  spec.yaml
+```
+
+PowerShell-эквивалент:
+
+```powershell
+(Get-Content spec.yaml) `
+  -replace '^(\s*)/_adapter:', '$1/q7x:' `
+  -replace '^(\s*)/_helper:',  '$1/k2m:' `
+  | Set-Content spec.yaml
+```
+
 Затем создайте gateway:
 
 ```bash

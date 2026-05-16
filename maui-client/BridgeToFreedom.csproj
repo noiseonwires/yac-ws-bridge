@@ -1,6 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst;net10.0-windows10.0.19041.0</TargetFrameworks>
+    <!--
+      iOS / Mac Catalyst can only be built on macOS, so we only include them
+      when the host is macOS. This keeps `dotnet workload restore` on Windows
+      / Linux CI from pulling in the (large) ios + maccatalyst workloads.
+      To build for iOS / Mac Catalyst locally, run on macOS — the TFMs will
+      light up automatically.
+    -->
+    <TargetFrameworks>net10.0-android;net10.0-windows10.0.19041.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
     <OutputType>Exe</OutputType>
     <RootNamespace>BridgeToFreedom</RootNamespace>
     <UseMaui>true</UseMaui>
