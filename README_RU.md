@@ -2,6 +2,12 @@
 
 Прокси-туннель через Yandex Cloud.
 
+[![Stars](https://img.shields.io/github/stars/noiseonwires/yac-ws-bridge?style=flat&logo=github)](https://github.com/noiseonwires/yac-ws-bridge/stargazers)
+[![Forks](https://img.shields.io/github/forks/noiseonwires/yac-ws-bridge?style=flat&logo=github)](https://github.com/noiseonwires/yac-ws-bridge/network/members)
+[![Go](https://img.shields.io/github/go-mod/go-version/noiseonwires/yac-ws-bridge?filename=adapter-and-helper%2Fgo.mod&logo=go)](https://go.dev/)
+[![Last commit](https://img.shields.io/github/last-commit/noiseonwires/yac-ws-bridge?logo=git)](https://github.com/noiseonwires/yac-ws-bridge/commits)
+[![License: WTFPL](https://img.shields.io/badge/license-WTFPL-blue.svg)](LICENSE)
+
 ## Что нового — 15.05.2026
 
 Эта версия серьёзно оптимизирована. Хелпер теперь переупорядочивает фреймы по `SeqID` на приёме, пред-регистрирует stream до отправки `OPEN` (так что первые DATA-пакеты после `OPEN_OK` больше не теряются), использует асинхронную очередь записи на каждый stream (медленный локальный клиент больше не блокирует все остальные streams), и корректно делает half-close по `FIN` (HTTP-ответы больше не обрываются). На практике: подключение устанавливается заметно быстрее, и туннель работает значительно стабильнее, особенно на мобильных устройствах.
@@ -11,6 +17,8 @@
 ## Что нового — 16.05.2026
 
 Путь HTTP-эндпоинта адаптера теперь настраивается через новый параметр `http.path` в `adapter.config.yaml` (по умолчанию `/conn-ids`), так что можно переименовать его в неузнаваемый без правки исходников. Соответственно, env-переменная cloud function `ADAPTER_URL` переименована в `HTTP_URL`, и её формат изменился: теперь ожидается **полный** URL эндпоинта (включая путь), например `https://your-server:8080/conn-ids`, а не только домен. Если вы обновляете существующий деплой, поменяйте и конфиг адаптера, и env-переменную функции. Подробнее — [Кастомизация путей эндпоинтов](#кастомизация-путей-эндпоинтов).
+
+**Если вам интересны упоротые туннели, построенные поверх протоколов, которые никогда не предназначались для туннелирования, обратите внимание также на мой другой проект: [True-IMAP-Tunnel](https://github.com/noiseonwires/true-imap-tunnel).**
 
 ## Версии
 

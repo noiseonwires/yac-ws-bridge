@@ -2,9 +2,17 @@
 
 (unofficial alias: **Bridge to Freedom**)
 
+[![Stars](https://img.shields.io/github/stars/noiseonwires/yac-ws-bridge?style=flat&logo=github)](https://github.com/noiseonwires/yac-ws-bridge/stargazers)
+[![Forks](https://img.shields.io/github/forks/noiseonwires/yac-ws-bridge?style=flat&logo=github)](https://github.com/noiseonwires/yac-ws-bridge/network/members)
+[![Go](https://img.shields.io/github/go-mod/go-version/noiseonwires/yac-ws-bridge?filename=adapter-and-helper%2Fgo.mod&logo=go)](https://go.dev/)
+[![Last commit](https://img.shields.io/github/last-commit/noiseonwires/yac-ws-bridge?logo=git)](https://github.com/noiseonwires/yac-ws-bridge/commits)
+[![License: WTFPL](https://img.shields.io/badge/license-WTFPL-blue.svg)](LICENSE)
+
 A TCP and WebSocket tunnel via YC (using Serverless Functions and API Gateway, and there's also an experimental branch that uses QUIC protocol mechanics over WS) to bypass Russian internet censorship under strict whitelist filtering.
 
 See [README_RU.md](README_RU.md) for documentation in Russian.
+
+**If you’re interested in other mind-blowing tunnels over things that were not designed for tunneling, please also check out my other project: [True-IMAP-Tunnel](https://github.com/noiseonwires/true-imap-tunnel).**
 
 ## What's new — 2026-05-15
 
