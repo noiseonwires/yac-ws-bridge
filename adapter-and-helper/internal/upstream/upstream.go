@@ -356,6 +356,20 @@ func (u *Upstream) pingLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// reconnectPause is the minimum delay between an upstream disconnect and the
+// next reconnect attempt. dial() only applies exponential backoff on connect
+// *failure*; this guards the success-then-immediate-drop case so a flapping
+// upstream can't hammer the API Gateway in a tight loop. Derived from the
+// configured initial backoff, with a floor so a missing/zero config can't
+// produce a busy loop.
+func (u *Upstream) reconnectPause() time.Duration {
+	d := u.cfg.InitialDelay()
+	if d < 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	return d
+}
+
 // Run connects and reconnects in a loop until ctx is cancelled.
 func (u *Upstream) Run(ctx context.Context) {
 	u.mu.Lock()
@@ -416,8 +430,14 @@ func (u *Upstream) Run(ctx context.Context) {
 		// the next periodic ping/sync cycle (~30s) or until the first incoming
 		// TCP connection triggers waitForPeer(). With it, peer is typically
 		// known after one round-trip (~200ms).
+		//
+		// Skip entirely in relay mode: there the data path is the upstream WS
+		// (the cloud relays to the adapter), so we never need peerConnID. Worse,
+		// a cold cloud instance may answer this SYNC with PEER_GONE, which the
+		// helper would otherwise act on — a self-inflicted teardown during
+		// startup. No SYNC, no spurious PEER_GONE.
 		u.mu.Lock()
-		needSync := u.peerConnID == ""
+		needSync := u.peerConnID == "" && !u.cfg.WsAPI.Relay
 		u.mu.Unlock()
 		if needSync {
 			f := protocol.Encode(protocol.Frame{Type: protocol.MsgSync})
@@ -458,5 +478,13 @@ func (u *Upstream) Run(ctx context.Context) {
 			return
 		}
 		log.Println("[INFO] upstream disconnected, reconnecting...")
+		// Minimum pause before reconnecting so a connection that drops right
+		// after a successful handshake isn't retried instantly.
+		select {
+		case <-ctx.Done():
+			log.Println("[INFO] upstream shut down")
+			return
+		case <-time.After(u.reconnectPause()):
+		}
 	}
 }

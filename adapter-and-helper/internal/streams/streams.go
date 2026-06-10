@@ -46,6 +46,7 @@ type reorderBuf struct {
 	mu       sync.Mutex
 	expected uint32
 	pending  map[uint32]protocol.Frame
+	broken   bool // overflowed; stream is being reset, drop further frames
 }
 
 func NewManager(send SendFunc) *Manager {
@@ -222,6 +223,14 @@ func (m *Manager) CloseHelper(shortID byte) int {
 	return len(victims)
 }
 
+// maxReorderPending bounds how many out-of-order frames are buffered per stream
+// while waiting for a missing SeqID. wsSend parallelism normally reorders only
+// a handful of frames; reaching this many pending almost certainly means a
+// frame was genuinely lost and the gap will never close. Rather than buffer
+// forever (unbounded memory + a permanently stalled stream), we give up: RST
+// the peer and tear the stream down so the application layer can recover.
+const maxReorderPending = 1024
+
 // HandleStreamFrame processes an incoming stream frame with optional reordering.
 // When Reorder is true, frames are buffered and delivered in SeqID order.
 // The handler callback is invoked for each frame in sequence order and may be
@@ -240,9 +249,15 @@ func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Fram
 	}
 	m.reorderMu.Unlock()
 
+	overflow := false
+	var overflowExpected uint32
 	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
+	if rb.broken {
+		// Stream already flagged for reset; drop further frames so the buffer
+		// can't regrow and we don't spawn duplicate resets.
+		rb.mu.Unlock()
+		return
+	}
 	if f.SeqID == rb.expected {
 		handler(f)
 		rb.expected++
@@ -258,12 +273,36 @@ func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Fram
 		}
 	} else if f.SeqID > rb.expected {
 		rb.pending[f.SeqID] = f
-		if len(rb.pending)%100 == 0 {
+		if len(rb.pending) > maxReorderPending {
+			overflow = true
+			overflowExpected = rb.expected
+			rb.broken = true
+		} else if len(rb.pending)%100 == 0 {
 			log.Printf("[WARN] reorder buffer growing stream=%d pending=%d expected=%d got=%d",
 				f.StreamID, len(rb.pending), rb.expected, f.SeqID)
 		}
 	} else {
 		log.Printf("[WARN] duplicate/old frame stream=%d seq=%d expected=%d", f.StreamID, f.SeqID, rb.expected)
+	}
+	rb.mu.Unlock()
+
+	if overflow {
+		log.Printf("[ERROR] reorder overflow stream=%d pending>%d expected=%d (lost frame?), resetting stream",
+			f.StreamID, maxReorderPending, overflowExpected)
+		streamID := f.StreamID
+		// Reset off the read-loop goroutine: SendFrame (wsSend) may block, and
+		// stalling here would delay delivery for every other stream. CloseStream
+		// -> Remove also clears this stream's reorder buffer + seq counter.
+		go func() {
+			_ = m.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID})
+			if s := m.Get(streamID); s != nil {
+				m.CloseStream(s)
+			} else {
+				m.reorderMu.Lock()
+				delete(m.reorderBufs, streamID)
+				m.reorderMu.Unlock()
+			}
+		}()
 	}
 }
 
@@ -276,9 +315,9 @@ func (m *Manager) ReadLoop(s *Stream) {
 	var coalesceBuf []byte
 	coalesce := m.CoalesceDelay > 0
 
-	flush := func() {
+	flush := func() error {
 		if len(coalesceBuf) == 0 {
-			return
+			return nil
 		}
 		payload := coalesceBuf
 		coalesceBuf = nil
@@ -288,12 +327,14 @@ func (m *Manager) ReadLoop(s *Stream) {
 			Payload:  payload,
 		}); sendErr != nil {
 			log.Printf("[WARN] send DATA failed stream=%d err=%v", s.ID, sendErr)
+			return sendErr
 		}
+		return nil
 	}
 
 	defer func() {
 		if coalesce {
-			flush()
+			_ = flush()
 		}
 		s.mu.Lock()
 		wasClosed := s.closed
@@ -320,7 +361,9 @@ func (m *Manager) ReadLoop(s *Stream) {
 				coalesceBuf = append(coalesceBuf, buf[:n]...)
 				// Flush immediately if buffer is large enough
 				if len(coalesceBuf) >= 32*1024 {
-					flush()
+					if flushErr := flush(); flushErr != nil {
+						return
+					}
 				}
 			} else {
 				payload := make([]byte, n)
@@ -338,7 +381,9 @@ func (m *Manager) ReadLoop(s *Stream) {
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				// Read deadline expired — flush buffered data and continue
-				flush()
+				if flushErr := flush(); flushErr != nil {
+					return
+				}
 				continue
 			}
 			return

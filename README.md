@@ -23,11 +23,17 @@ Also, multiple clients (helpers) can now connect to the same adapter/function si
 
 The adapter's HTTP endpoint path is now configurable via the new `http.path` setting in `adapter.config.yaml` (default `/conn-ids`), so you can rename it to something non-fingerprintable without editing source code. Correspondingly, the cloud function env var `ADAPTER_URL` has been renamed to `HTTP_URL` and its format has changed: it now expects the **full** URL of the adapter's endpoint (including the path), e.g. `https://your-server:8080/conn-ids`, instead of just the HTTP base. If you upgrade an existing deployment, update both the adapter config and the function's env variable. See [Customizing endpoint paths](#customizing-endpoint-paths) for details.
 
+## What's new — 2026-06-15
+
+A round of stability and performance hardening across all components. **Backward compatibility is preserved** — wire protocol, config format, and cloud-function env vars are unchanged, so mixed-version setups keep working (updating all three together is still recommended).
+
+Highlights: the Go helper no longer drops the first response bytes (pre-registers streams + reorders incoming frames); reorder buffers are capped so a lost frame resets the stream instead of hanging forever; `wsSend` calls have a timeout and the gRPC client recovers from transient startup errors; the upstream waits briefly before reconnecting; the adapter's public HTTP endpoint got timeouts and constant-time auth; the Cloud Function fans out to helpers in parallel; and the MAUI client's write-coalescing was rewritten to drop a quadratic copy and a blocking read.
+
 ## Versions
 
 The tunnel comes in four variants:
 
-1. Single-adapter variant (branch `one-adapter`): proxies WebSocket connections (VLESS with WS transport or XMPP-over-WebSockets, for example). Does not require modifying clients or installing extra software on the client device — just point your WebSocket URL at the serverless function. Works slowly and very unstably. See README_RU.md in the `one-adapter` branch for details.
+1. Single-adapter variant (branch `one-adapter`): proxies WebSocket connections (VLESS with WS transport or XMPP-over-WebSockets, for example). Does not require modifying clients or installing extra software on the client device — just point your WebSocket URL at the serverless function. Works slowly and sometimes unstably. See README_RU.md in the `one-adapter` branch for details.
 
 2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster. **(Use this version if you don't know from where to start!)**
 
@@ -373,7 +379,7 @@ yc serverless function version create \
   --entrypoint index.handler \
   --memory 128m \
   --execution-timeout 10s \
-  --concurrency 16 \
+  --concurrency 4 \
   --source-path bridge-function.zip \
   --service-account-id $SA_ID \
   --environment "AUTH_TOKEN=<your-shared-secret>,HTTP_URL=<adapter-http-recovery-url>"

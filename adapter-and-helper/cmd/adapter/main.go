@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -124,6 +125,12 @@ func main() {
 			}
 			log.Printf("[DEBUG] PONG received, tokenLen=%d", len(iamToken))
 			ups.SetIAMToken(iamToken)
+		case protocol.MsgPing:
+			// We never answer PINGs (only the cloud function does). A stray PING
+			// can still reach us if an older cloud function relays the peer's
+			// keepalive instead of handling it; ignore it quietly instead of
+			// logging it as an unknown frame.
+			log.Printf("[DEBUG] ignoring stray PING")
 
 		// --- Stream ---
 		case protocol.MsgOpen, protocol.MsgData, protocol.MsgFin, protocol.MsgRst:
@@ -193,7 +200,7 @@ func main() {
 				return
 			}
 			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if token != cfg.Bridge.AuthToken {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.Bridge.AuthToken)) != 1 {
 				log.Printf("[WARN] %s unauthorized request from %s", httpPath, r.RemoteAddr)
 				w.WriteHeader(http.StatusUnauthorized)
 				return
@@ -234,7 +241,17 @@ func main() {
 			json.NewEncoder(w).Encode(resp)
 		})
 		addr := fmt.Sprintf(":%d", cfg.HTTP.ListenPort)
-		srv := &http.Server{Addr: addr, Handler: mux}
+		// This endpoint is exposed to the public internet (the cloud function
+		// polls it on cold start). Set timeouts so slow or half-open clients
+		// can't tie up connections indefinitely (Slowloris-style exhaustion).
+		srv := &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 		go func() {
 			log.Printf("[INFO] HTTP server starting addr=%s", addr)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

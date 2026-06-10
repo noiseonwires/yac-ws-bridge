@@ -348,19 +348,35 @@ public sealed class TunnelService : IDisposable
             {
                 // Read full message (may arrive in multiple frames)
                 int totalRead = 0;
+                bool oversized = false;
                 WebSocketReceiveResult result;
                 do
                 {
                     if (totalRead >= buffer.Length)
                     {
-                        Log($"Message too large, dropping (>{buffer.Length} bytes)");
-                        return;
+                        // Message exceeds our buffer. Rather than tear down the
+                        // whole upstream (which drops every active stream), drain
+                        // the remainder of THIS message and drop just it. Frames
+                        // never legitimately exceed the buffer, so this is purely
+                        // defensive against a bug or a hostile peer.
+                        oversized = true;
+                        result = await _upstream!.ReceiveAsync(
+                            new ArraySegment<byte>(buffer, 0, buffer.Length), ct);
                     }
-                    result = await _upstream!.ReceiveAsync(
-                        new ArraySegment<byte>(buffer, totalRead, buffer.Length - totalRead), ct);
+                    else
+                    {
+                        result = await _upstream!.ReceiveAsync(
+                            new ArraySegment<byte>(buffer, totalRead, buffer.Length - totalRead), ct);
+                        totalRead += result.Count;
+                    }
                     if (result.MessageType == WebSocketMessageType.Close) return;
-                    totalRead += result.Count;
                 } while (!result.EndOfMessage);
+
+                if (oversized)
+                {
+                    Log($"Message too large (>{buffer.Length} bytes), dropped one frame");
+                    continue;
+                }
 
                 if (result.MessageType != WebSocketMessageType.Binary) continue;
 
@@ -398,6 +414,19 @@ public sealed class TunnelService : IDisposable
                     return;
 
                 case Protocol.MsgPeerGone:
+                    if (Relay)
+                    {
+                        // In relay mode the data path runs through the cloud (our
+                        // upstream WS), NOT via direct wsSend to the peer connId.
+                        // A PEER_GONE here is usually just a cold cloud instance
+                        // answering discovery with "I don't know the adapter yet";
+                        // it does NOT mean our streams are dead. Tearing them down
+                        // (as direct mode must) would cancel in-flight opens and
+                        // kill working streams. A genuinely gone adapter instead
+                        // surfaces as per-stream OPEN_FAIL/RST from the cloud.
+                        Log("Peer gone (relay mode) — ignoring, data path is via cloud relay");
+                        return;
+                    }
                     Log($"Peer gone, closing {_streams.Count} streams");
                     _peerConnId = "";
                     CancelPendingOpens("peer gone");
@@ -407,6 +436,14 @@ public sealed class TunnelService : IDisposable
                 case Protocol.MsgPong:
                     var token = Protocol.DecodePong(payload);
                     if (token != "") _iamToken = token;
+                    return;
+
+                case Protocol.MsgPing:
+                    // We never answer PINGs (only the cloud function does). A
+                    // stray PING can still arrive if an older cloud function
+                    // relays a peer's keepalive instead of handling it; ignore
+                    // it quietly instead of logging an "unknown frame" warning.
+                    // Matches the Go helper/adapter behaviour.
                     return;
 
                 case Protocol.MsgOpenOK:
@@ -455,6 +492,14 @@ public sealed class TunnelService : IDisposable
     }
 
     /// <summary>
+    /// Maximum out-of-order frames buffered per stream while waiting for a
+    /// missing SeqID. Reaching this almost certainly means a frame was lost and
+    /// the gap will never close, so we reset the stream rather than buffer
+    /// forever (unbounded memory + a permanently stalled stream).
+    /// </summary>
+    private const int MaxReorderPending = 1024;
+
+    /// <summary>
     /// Routes an inbound stream frame through the per-stream reorder buffer.
     /// Frames with seqId == 0 (legacy/uninitialized) are delivered immediately.
     /// Otherwise frames are delivered strictly in ascending seqId order; gaps
@@ -468,6 +513,7 @@ public sealed class TunnelService : IDisposable
             return;
         }
 
+        bool overflow = false;
         lock (s.ReorderLock)
         {
             if (seqId == s.ExpectedRecvSeq)
@@ -488,7 +534,11 @@ public sealed class TunnelService : IDisposable
                 // Gap — buffer until the missing predecessor(s) arrive.
                 s.ReorderPending[seqId] = rawData;
                 var pending = s.ReorderPending.Count;
-                if (pending > 0 && pending % 50 == 0)
+                if (pending > MaxReorderPending)
+                {
+                    overflow = true;
+                }
+                else if (pending > 0 && pending % 50 == 0)
                 {
                     Log($"reorder buffer growing stream={s.Id} pending={pending} " +
                         $"expected={s.ExpectedRecvSeq} got={seqId}");
@@ -499,6 +549,15 @@ public sealed class TunnelService : IDisposable
                 // seqId < expected: duplicate or stale frame.
                 Log($"duplicate/old frame stream={s.Id} seq={seqId} expected={s.ExpectedRecvSeq} type={Protocol.MsgName(type)}");
             }
+        }
+
+        if (overflow)
+        {
+            Log($"reorder overflow stream={s.Id} pending>{MaxReorderPending} (lost frame?), resetting stream");
+            // Tell the peer to abort this stream, then tear it down locally.
+            try { _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgRst, s.Id, NextSeq(s.Id))); }
+            catch { }
+            CloseStream(s);
         }
     }
 
@@ -801,16 +860,36 @@ public sealed class TunnelService : IDisposable
     private async Task TcpReadLoopAsync(StreamState state, CancellationToken ct)
     {
         var buf = new byte[32 * 1024];
-        byte[]? coalesceBuf = null;
         var coalesce = WriteCoalescing && WriteCoalescingDelayMs > 0;
 
-        async Task FlushCoalesce()
+        // Reusable accumulation buffer for coalescing, grown by doubling and
+        // reused across flushes. The old code rebuilt the entire buffer on every
+        // append (new byte[old+n] + two copies) — O(n^2) for a busy stream.
+        byte[] coalesceBuf = coalesce ? new byte[32 * 1024] : Array.Empty<byte>();
+        int coalesceLen = 0;
+
+        async Task<bool> FlushCoalesce()
         {
-            if (coalesceBuf == null || coalesceBuf.Length == 0) return;
-            var data = coalesceBuf;
-            coalesceBuf = null;
+            if (coalesceLen == 0) return true;
+            var data = new byte[coalesceLen];
+            Buffer.BlockCopy(coalesceBuf, 0, data, 0, coalesceLen);
+            coalesceLen = 0;
             var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgData, state.Id, NextSeq(state.Id), data));
-            if (err != null) Log($"Send DATA failed stream={state.Id}: {err}");
+            if (err != null) { Log($"Send DATA failed stream={state.Id}: {err}"); return false; }
+            return true;
+        }
+
+        void Append(int n)
+        {
+            int needed = coalesceLen + n;
+            if (coalesceBuf.Length < needed)
+            {
+                int cap = coalesceBuf.Length == 0 ? 32 * 1024 : coalesceBuf.Length;
+                while (cap < needed) cap *= 2;
+                Array.Resize(ref coalesceBuf, cap);
+            }
+            Buffer.BlockCopy(buf, 0, coalesceBuf, coalesceLen, n);
+            coalesceLen += n;
         }
 
         try
@@ -819,33 +898,26 @@ public sealed class TunnelService : IDisposable
             while (!linked.IsCancellationRequested)
             {
                 int n;
-                if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
+                if (coalesce && coalesceLen > 0)
                 {
-                    // We have buffered data. Check if more is already waiting.
-                    if (state.NetStream.DataAvailable)
+                    // We have buffered data. If more is already waiting, grab it
+                    // immediately; otherwise wait up to the coalescing delay for
+                    // more data, then flush what we have.
+                    if (!state.NetStream.DataAvailable)
                     {
-                        // Data in kernel buffer — read immediately without blocking
-                        n = state.NetStream.Read(buf, 0, buf.Length);
-                    }
-                    else
-                    {
-                        // Nothing waiting — give it coalescingMs for more data to arrive
-                        await Task.Delay(WriteCoalescingDelayMs, linked.Token);
-                        if (state.NetStream.DataAvailable)
+                        try { await Task.Delay(WriteCoalescingDelayMs, linked.Token); }
+                        catch (OperationCanceledException) { break; }
+                        if (!state.NetStream.DataAvailable)
                         {
-                            n = state.NetStream.Read(buf, 0, buf.Length);
-                        }
-                        else
-                        {
-                            // Still nothing — flush what we have and block for next read
-                            await FlushCoalesce();
+                            if (!await FlushCoalesce()) return;
                             continue;
                         }
                     }
+                    n = await state.NetStream.ReadAsync(buf, 0, buf.Length, linked.Token);
                 }
                 else
                 {
-                    // No buffered data (or coalescing off) — block until data arrives
+                    // No buffered data (or coalescing off) — block until data arrives.
                     n = await state.NetStream.ReadAsync(buf, 0, buf.Length, linked.Token);
                 }
 
@@ -853,22 +925,12 @@ public sealed class TunnelService : IDisposable
 
                 if (coalesce)
                 {
-                    // Append to coalesce buffer
-                    if (coalesceBuf == null)
+                    Append(n);
+                    // Flush immediately if buffer is large enough.
+                    if (coalesceLen >= 32 * 1024)
                     {
-                        coalesceBuf = new byte[n];
-                        Buffer.BlockCopy(buf, 0, coalesceBuf, 0, n);
+                        if (!await FlushCoalesce()) return;
                     }
-                    else
-                    {
-                        var newBuf = new byte[coalesceBuf.Length + n];
-                        Buffer.BlockCopy(coalesceBuf, 0, newBuf, 0, coalesceBuf.Length);
-                        Buffer.BlockCopy(buf, 0, newBuf, coalesceBuf.Length, n);
-                        coalesceBuf = newBuf;
-                    }
-                    // Flush immediately if buffer is large enough
-                    if (coalesceBuf.Length >= 32 * 1024)
-                        await FlushCoalesce();
                 }
                 else
                 {
@@ -885,7 +947,7 @@ public sealed class TunnelService : IDisposable
         finally
         {
             // Flush any remaining buffered data
-            if (coalesce && coalesceBuf != null && coalesceBuf.Length > 0)
+            if (coalesce && coalesceLen > 0)
             {
                 try { await FlushCoalesce(); } catch { }
             }

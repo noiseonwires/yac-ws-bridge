@@ -85,6 +85,11 @@ func main() {
 		return err
 	})
 	sm.CoalesceDelay = cfg.CoalesceDelay()
+	// Reorder incoming (adapter -> helper) stream frames by SeqID. That path
+	// goes through the YC wsSend API, whose parallel HTTP processing can deliver
+	// frames to our upstream WS out of order. Mirrors the adapter and the MAUI
+	// client (both of which already reorder on receive).
+	sm.Reorder = true
 
 	ups = upstream.New(cfg, func(f protocol.Frame) {
 		switch f.Type {
@@ -107,6 +112,18 @@ func main() {
 				ups.SetIAMToken(iamToken)
 			}
 		case protocol.MsgPeerGone:
+			if relay {
+				// In relay mode the data path runs through the cloud (our upstream
+				// WS), NOT via direct wsSend to peerConnID. A PEER_GONE here is
+				// usually just a cold cloud instance answering our discovery SYNC
+				// with "I don't know the adapter yet" — it does NOT mean our streams
+				// are dead. Tearing everything down (as direct mode must) would
+				// cancel in-flight opens and kill working streams for no reason. A
+				// genuinely gone adapter instead surfaces as per-stream OPEN_FAIL/RST
+				// relayed back by the cloud, which we handle individually.
+				log.Printf("[INFO] PEER_GONE received (relay mode) — ignoring, data path is via cloud relay")
+				return
+			}
 			log.Printf("[INFO] PEER_GONE received, closing %d streams", sm.Count())
 			ups.SetPeerConnID("")
 			cancelPendingOpens("peer gone")
@@ -119,43 +136,49 @@ func main() {
 			}
 			log.Printf("[DEBUG] PONG received, tokenLen=%d", len(iamToken))
 			ups.SetIAMToken(iamToken)
+		case protocol.MsgPing:
+			// We never answer PINGs (only the cloud function does). A stray PING
+			// can still reach us if an older cloud function relays a peer's
+			// keepalive instead of handling it; ignore it quietly instead of
+			// logging it as an unknown frame.
+			log.Printf("[DEBUG] ignoring stray PING")
 
-		// --- Stream responses ---
-		case protocol.MsgOpenOK, protocol.MsgOpenFail:
-			typeName := "OPEN_OK"
-			if f.Type == protocol.MsgOpenFail {
-				typeName = "OPEN_FAIL"
+		// --- Stream frames ---
+		case protocol.MsgOpenOK, protocol.MsgOpenFail, protocol.MsgData, protocol.MsgFin, protocol.MsgRst:
+			if f.Type == protocol.MsgFin || f.Type == protocol.MsgRst {
+				log.Printf("[INFO] %s received stream=%d seq=%d",
+					map[byte]string{protocol.MsgFin: "FIN", protocol.MsgRst: "RST"}[f.Type], f.StreamID, f.SeqID)
 			}
-			log.Printf("[INFO] %s received stream=%d", typeName, f.StreamID)
-			pendingMu.Lock()
-			ch, ok := pendingOpens[f.StreamID]
-			pendingMu.Unlock()
-			if ok {
-				ch <- f
-			} else {
-				log.Printf("[WARN] %s for unknown stream=%d", typeName, f.StreamID)
-			}
-
-		case protocol.MsgData:
+			// Probe streams bypass reorder and the stream manager entirely:
+			// OPEN_OK/OPEN_FAIL go to the pending-open waiter, DATA/FIN/RST go to
+			// the probe's dedicated channel (runProbe drains it).
 			if protocol.IsProbe(f.StreamID) {
-				deliverProbeFrame(&probeMu, probeChans, f)
+				switch f.Type {
+				case protocol.MsgOpenOK, protocol.MsgOpenFail:
+					deliverOpen(&pendingMu, pendingOpens, f)
+				default:
+					deliverProbeFrame(&probeMu, probeChans, f)
+				}
 				return
 			}
-			sm.HandleData(f.StreamID, f.Payload)
-		case protocol.MsgFin:
-			log.Printf("[INFO] FIN received stream=%d seq=%d", f.StreamID, f.SeqID)
-			if protocol.IsProbe(f.StreamID) {
-				deliverProbeFrame(&probeMu, probeChans, f)
-				return
-			}
-			sm.HandleFin(f.StreamID)
-		case protocol.MsgRst:
-			log.Printf("[INFO] RST received stream=%d seq=%d", f.StreamID, f.SeqID)
-			if protocol.IsProbe(f.StreamID) {
-				deliverProbeFrame(&probeMu, probeChans, f)
-				return
-			}
-			sm.HandleRst(f.StreamID)
+			// Deliver in SeqID order (adapter -> helper can arrive reordered).
+			sm.HandleStreamFrame(f, func(of protocol.Frame) {
+				switch of.Type {
+				case protocol.MsgOpenOK, protocol.MsgOpenFail:
+					typeName := "OPEN_OK"
+					if of.Type == protocol.MsgOpenFail {
+						typeName = "OPEN_FAIL"
+					}
+					log.Printf("[INFO] %s received stream=%d", typeName, of.StreamID)
+					deliverOpen(&pendingMu, pendingOpens, of)
+				case protocol.MsgData:
+					sm.HandleData(of.StreamID, of.Payload)
+				case protocol.MsgFin:
+					sm.HandleFin(of.StreamID)
+				case protocol.MsgRst:
+					sm.HandleRst(of.StreamID)
+				}
+			})
 		default:
 			log.Printf("[WARN] unknown frame type=0x%02x stream=%d", f.Type, f.StreamID)
 		}
@@ -234,6 +257,13 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *
 
 	s := &streams.Stream{ID: sid, Conn: conn}
 
+	// Pre-register the stream BEFORE sending OPEN so that DATA frames the peer
+	// sends immediately after OPEN_OK are not dropped in the window between
+	// OPEN_OK arriving and this goroutine resuming. The adapter starts its
+	// target read loop right after sending OPEN_OK, so the first response bytes
+	// can reach us before we'd otherwise have registered the stream.
+	sm.Register(s)
+
 	// Register pending open
 	ch := make(chan protocol.Frame, 1)
 	pendingMu.Lock()
@@ -249,7 +279,7 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *
 	// Send OPEN
 	if err := sm.SendFrame(protocol.Frame{Type: protocol.MsgOpen, StreamID: sid}); err != nil {
 		log.Printf("[WARN] send OPEN failed stream=%d err=%v", sid, err)
-		conn.Close()
+		sm.CloseStream(s)
 		return
 	}
 	log.Printf("[INFO] OPEN sent stream=%d, waiting for response...", sid)
@@ -260,27 +290,26 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *
 		if !ok {
 			// Channel closed — peer disconnected/reconnected while we were waiting
 			log.Printf("[INFO] stream aborted during open (peer reset) stream=%d", sid)
-			conn.Close()
+			sm.CloseStream(s)
 			return
 		}
 		if resp.Type == protocol.MsgOpenFail {
 			log.Printf("[INFO] stream rejected stream=%d reason=%s", sid, string(resp.Payload))
-			conn.Close()
+			sm.CloseStream(s)
 			return
 		}
 		log.Printf("[INFO] stream opened stream=%d remote=%s", sid, conn.RemoteAddr())
 	case <-time.After(30 * time.Second):
 		log.Printf("[WARN] OPEN timeout stream=%d (no response in 30s)", sid)
-		conn.Close()
+		sm.CloseStream(s)
 		return
 	case <-ctx.Done():
 		log.Printf("[INFO] stream cancelled during open stream=%d", sid)
-		conn.Close()
+		sm.CloseStream(s)
 		return
 	}
 
-	// Stream is open
-	sm.Register(s)
+	// Stream is already registered; start forwarding local -> peer.
 	sm.ReadLoop(s)
 }
 
@@ -340,6 +369,21 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 			}
 		}
 	}
+}
+
+// deliverOpen routes an OPEN_OK/OPEN_FAIL frame to the goroutine (handleConn or
+// runProbe) waiting on the per-stream pending-open channel. The channels are
+// buffered (size 1) and exactly one OPEN response is expected per stream, so
+// the send never blocks the upstream read loop.
+func deliverOpen(mu *sync.Mutex, pendingOpens map[uint32]chan protocol.Frame, f protocol.Frame) {
+	mu.Lock()
+	ch, ok := pendingOpens[f.StreamID]
+	mu.Unlock()
+	if ok {
+		ch <- f
+		return
+	}
+	log.Printf("[WARN] OPEN response for unknown stream=%d type=0x%02x", f.StreamID, f.Type)
 }
 
 // deliverProbeFrame hands a DATA/FIN/RST frame for a probe-flagged stream to

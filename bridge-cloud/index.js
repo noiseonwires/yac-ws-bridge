@@ -9,12 +9,23 @@
 
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const HTTP_URL = process.env.HTTP_URL || null;
 
 const httpsAgent = new https.Agent({ keepAlive: true });
 const httpAgent = new http.Agent({ keepAlive: true });
+
+// Constant-time auth-token comparison to avoid leaking the shared secret via
+// response timing. timingSafeEqual requires equal-length buffers, so compare
+// lengths first (the length itself is not secret).
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a), 'utf-8');
+  const bb = Buffer.from(String(b), 'utf-8');
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
 
 // Message type names for logging.
 const MSG_NAMES = {
@@ -36,6 +47,7 @@ const helpers = new Map();        // connId -> shortId
 const usedShortIds = new Set();   // for fast allocation
 let _initPromise = null;
 let _lastFetchMs = 0; // timestamp of last fetchConnIds call
+let _inflightFetch = null; // shared in-flight /conn-ids refresh (coalesces concurrent lookups)
 
 function allocateShortId() {
   for (let i = 1; i <= 255; i++) {
@@ -94,6 +106,9 @@ function httpGet(url, headers) {
       headers: headers || {},
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d })); });
     req.on('error', reject);
+    // Bound the GET so a slow/hung adapter HTTP endpoint can't wedge the
+    // coalesced refresh (every concurrent frame awaiting it would stall).
+    req.setTimeout(2500, () => req.destroy(new Error('timeout')));
     req.end();
   });
 }
@@ -102,12 +117,14 @@ function httpGet(url, headers) {
 // If iamToken is provided, also pass it to the adapter as X-IAM-Token so the
 // adapter can refresh its cached IAM token without needing a PING/PONG round
 // trip. The init-time call (no handler context yet) skips this header.
-async function fetchConnIds(iamToken) {
+// maxAttempts bounds the internal retry loop; the relay hot path passes 1 for
+// a quick single-shot re-learn (it must stay well under the function timeout).
+async function fetchConnIds(iamToken, maxAttempts = 3) {
   if (!HTTP_URL) return;
   const url = HTTP_URL;
   const headers = { 'Authorization': 'Bearer ' + AUTH_TOKEN };
   if (iamToken) headers['X-IAM-Token'] = iamToken;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       console.log(`fetchConnIds attempt=${attempt} url=${url} iamTokenLen=${(iamToken || '').length}`);
       const r = await httpGet(url, headers);
@@ -137,17 +154,34 @@ async function fetchConnIds(iamToken) {
       console.error(`fetchConnIds attempt=${attempt} err=${e.message || e}`);
     }
     // Wait before retry (500ms, 1s)
-    if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 500));
+    if (attempt < maxAttempts) await new Promise(r => setTimeout(r, attempt * 500));
   }
   console.warn('fetchConnIds: all retries exhausted, proceeding without conn-ids');
 }
 
+// Coalesced /conn-ids refresh. Concurrent callers share ONE in-flight GET and
+// all await its result. This is the key relay-mode fix: in relay mode every
+// data frame needs the cloud instance to know a live adapterConnId, but with
+// serverless concurrency a cold/parallel instance receives a burst of frames
+// at once. The previous per-call throttle let only the first frame fetch and
+// made the rest return early with adapterConnId still null — surfacing as
+// "no adapter connected" RSTs even though the adapter was up. Coalescing lets
+// every racing frame await the same lookup and then succeed.
+function refreshConnIds(iamToken, maxAttempts = 1) {
+  if (_inflightFetch) return _inflightFetch;
+  _lastFetchMs = Date.now();
+  _inflightFetch = fetchConnIds(iamToken, maxAttempts)
+    .catch(e => { console.error(`refreshConnIds err=${(e && e.message) || e}`); })
+    .finally(() => { _inflightFetch = null; });
+  return _inflightFetch;
+}
+
 _initPromise = fetchConnIds();
 
-// Try to learn the missing peer's connId via the adapter HTTP endpoint.
-// Skips if called within the last 2 seconds to avoid hammering.
-// Passes the current IAM token along so the adapter can refresh its cached one.
-// Ensure local cache knows the peer of interest. For helpers, an optional
+// Ensure the local cache knows the peer of interest, refreshing from the
+// adapter's HTTP endpoint if needed. Concurrent callers coalesce onto a single
+// in-flight refresh (see refreshConnIds). Passes the current IAM token along so
+// the adapter can refresh its cached one. For helpers, an optional
 // `requiredHelperConnId` makes the check helper-specific: even when other
 // helpers are already known, we still re-fetch if this particular connId is
 // missing. That matters for serverless cold starts where a MESSAGE for a new
@@ -155,8 +189,6 @@ _initPromise = fetchConnIds();
 // re-syncing we could allocate a shortId that collides with one the adapter
 // already has for someone else.
 async function ensurePeerKnown(which, iamToken, requiredHelperConnId = null) {
-  const now = Date.now();
-  if (now - _lastFetchMs < 2000) return;
   if (which === 'adapter' && adapterConnId) return;
   if (which === 'helper') {
     if (requiredHelperConnId) {
@@ -165,9 +197,15 @@ async function ensurePeerKnown(which, iamToken, requiredHelperConnId = null) {
       return;
     }
   }
-  console.log(`ensurePeerKnown: ${which} unknown (required=${requiredHelperConnId || 'any'}), calling fetchConnIds`);
-  _lastFetchMs = now;
-  await fetchConnIds(iamToken);
+  // Always refresh when the peer is unknown. There is NO time-based throttle:
+  // refreshConnIds already coalesces concurrent callers onto a single in-flight
+  // GET, so a burst of frames can't cause a fetch storm, and relay correctness
+  // depends on actually fetching when we have no peer to deliver to. The old
+  // "skip if fetched in the last N ms" guard is exactly what left cold/parallel
+  // instances with adapterConnId=null and produced spurious "adapter
+  // unreachable" RSTs in relay mode.
+  console.log(`ensurePeerKnown: ${which} unknown (required=${requiredHelperConnId || 'any'}), refreshing conn-ids`);
+  await refreshConnIds(iamToken, requiredHelperConnId ? 2 : 3);
 }
 
 // WS management API — send binary data to a connection.
@@ -195,9 +233,98 @@ async function wsSend(connId, data, token) {
       });
     });
     req.on('error', e => { console.error(`wsSend ERR connId=${connId} err=${e.message} ms=${Date.now() - start}`); resolve(500); });
+    // Bound the call so a hung YC API request can't burn the whole function
+    // execution timeout (and so the relay retry path can react promptly).
+    req.setTimeout(3000, () => { console.error(`wsSend TIMEOUT connId=${connId} ms=${Date.now() - start}`); req.destroy(new Error('timeout')); });
     req.write(body);
     req.end();
   });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// True for wsSend HTTP statuses that mean "this connectionId is gone" (the
+// adapter closed/reconnected), as opposed to transient errors (429 rate limit,
+// 5xx, our 500 timeout sentinel) where the SAME connId is still valid and we
+// should just retry rather than rediscover.
+function connIdGone(status) { return status === 400 || status === 404 || status === 410; }
+
+// Relay a single helper stream-frame to the adapter, resiliently.
+// Returns null on success, or a binary RST/OPEN_FAIL frame to send back to the
+// helper only when the adapter is genuinely unreachable.
+//
+// Two failure modes this must survive, because APIGW spreads ONE helper's
+// frames across MANY serverless instances (each with its own module-global
+// adapterConnId):
+//   1. Cold instance: adapterConnId is unknown -> fetch it from /conn-ids.
+//   2. Stale instance: adapterConnId is cached but the adapter reconnected with
+//      a NEW connId, so wsSend to the old id fails.
+//
+// The cure for BOTH is the same: on any failure, RE-FETCH the authoritative id
+// from the adapter's /conn-ids. fetchConnIds only overwrites adapterConnId on a
+// real HTTP 200, so a failed fetch never corrupts it. Crucially we NEVER set
+// adapterConnId=null here: this global is shared by every concurrent invocation
+// on the instance, and nulling it on one frame's hiccup cascades "unreachable"
+// to all the others (the collapse seen in the logs while the adapter was up).
+async function relayToAdapter(buf, type, streamId, token) {
+  const deadline = Date.now() + 8500; // stay under the 10s function timeout
+  let healed = false;                 // re-fetched a fresh id at least once
+  for (let attempt = 1; attempt <= 4 && Date.now() < deadline; attempt++) {
+    if (!adapterConnId) {
+      await refreshConnIds(token, 1);
+      if (!adapterConnId) {
+        // Cold instance and the fetch didn't land yet; pause and retry it.
+        if (Date.now() < deadline) await sleep(300);
+        continue;
+      }
+    }
+    const id = adapterConnId;
+    const st = await wsSend(id, buf, token);
+    if (st < 400) {
+      if (attempt > 1) console.log(`relay ${msgName(type)} stream=${streamId} -> adapter ${id} OK (attempt ${attempt})`);
+      return null;
+    }
+    console.error(`relay ${msgName(type)} stream=${streamId} status=${st} attempt=${attempt} id=${id}`);
+    // Re-fetch the authoritative id once. If it changed, the cached id was
+    // stale (adapter reconnected) -> retry the fresh id immediately. If it's
+    // unchanged, the adapter is healthy and this was a transient API error ->
+    // pause and retry the same id.
+    if (!healed && Date.now() < deadline) {
+      healed = true;
+      const before = adapterConnId;
+      await refreshConnIds(token, 1);
+      if (adapterConnId && adapterConnId !== before) {
+        console.log(`relay ${msgName(type)} stream=${streamId}: healed adapter id ${before} -> ${adapterConnId}, retrying`);
+        continue;
+      }
+    }
+    if (Date.now() < deadline) await sleep(300);
+  }
+  console.warn(`relay ${msgName(type)} stream=${streamId}: adapter unreachable after retries, signalling helper`);
+  return type === MSG_OPEN
+    ? binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('adapter unreachable')))
+    : binaryResp(encodeStreamFrame(MSG_RST, streamId));
+}
+
+// Send the same frame to many helper connections in parallel, dropping any the
+// WS API reports as stale (status >= 400). Parallel fan-out bounds the total
+// time by the slowest single wsSend instead of their sum, which matters
+// against the function execution timeout when several helpers are connected.
+async function notifyHelpers(connIds, frame, token, label) {
+  if (!connIds.length) return;
+  const results = await Promise.all(connIds.map(id =>
+    wsSend(id, frame, token).then(st => ({ id, st }))));
+  for (const { id, st } of results) {
+    // Only drop a helper when the API says its connection is gone. A transient
+    // 429/5xx must NOT evict a healthy helper (that would churn its shortId and
+    // disrupt its live streams) — same shared-state hazard as the adapter side.
+    if (connIdGone(st)) {
+      console.log(`${label}: helper ${id} is gone (status=${st}), dropping`);
+      forgetHelper(id);
+    } else if (st >= 400) {
+      console.log(`${label}: transient wsSend to helper ${id} (status=${st}), keeping`);
+    }
+  }
 }
 
 // --- Protocol encode helpers ---
@@ -306,20 +433,17 @@ async function handle(event, context) {
       if (type === MSG_HELLO) {
         const ver = buf[9];
         const tok = buf.subarray(10).toString('utf-8');
-        if (ver !== 1 || tok !== AUTH_TOKEN) {
-          console.error(`adapter HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
+        const tokenOk = safeEqual(tok, AUTH_TOKEN);
+        if (ver !== 1 || !tokenOk) {
+          console.error(`adapter HELLO auth failed ver=${ver} tokenMatch=${tokenOk}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
         if (helpers.size === 0) await ensurePeerKnown('helper', token);
-        // Notify EVERY known helper that the adapter is here.
-        for (const [hConnId] of Array.from(helpers)) {
-          console.log(`adapter HELLO: notifying helper ${hConnId} of adapter connId`);
-          const st = await wsSend(hConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token, 0)), token);
-          if (st >= 400) {
-            console.log(`adapter HELLO: helper ${hConnId} is stale (status=${st}), dropping`);
-            forgetHelper(hConnId);
-          }
-        }
+        // Notify EVERY known helper that the adapter is here (in parallel).
+        await notifyHelpers(
+          Array.from(helpers).map(([hConnId]) => hConnId),
+          encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token, 0)),
+          token, 'adapter HELLO');
         console.log(`adapter authenticated connId=${adapterConnId} helpers=${helpers.size} tokenLen=${token.length}`);
         // Adapter HELLO_OK no longer carries a peerId (multi-helper). The
         // adapter learns each helper via separate PEER_CONN frames pushed via
@@ -333,15 +457,12 @@ async function handle(event, context) {
           adapterConnId = connId;
         }
         if (helpers.size === 0) await ensurePeerKnown('helper', token);
-        // Cross-notify each helper of the adapter (covers cross-instance state loss).
-        for (const [hConnId] of Array.from(helpers)) {
-          console.log(`adapter PING: cross-notifying helper ${hConnId} of adapter connId`);
-          const st = await wsSend(hConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token, 0)), token);
-          if (st >= 400) {
-            console.log(`adapter PING: helper ${hConnId} is stale (status=${st}), dropping`);
-            forgetHelper(hConnId);
-          }
-        }
+        // Cross-notify each helper of the adapter (covers cross-instance state
+        // loss), in parallel.
+        await notifyHelpers(
+          Array.from(helpers).map(([hConnId]) => hConnId),
+          encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token, 0)),
+          token, 'adapter PING');
         console.log(`adapter PING -> PONG tokenLen=${token.length}`);
         return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
       }
@@ -352,26 +473,23 @@ async function handle(event, context) {
           return binaryResp(encodeControl(MSG_PEER_GONE));
         }
         // Announce every known helper to the adapter so it can rebuild its
-        // routing table. Push the second-and-later entries via wsSend; return
-        // the first as the SYNC response.
+        // routing table. Return the first entry as the SYNC response and push
+        // the second-and-later entries to the adapter in parallel.
         const entries = Array.from(helpers); // [[connId, shortId], ...]
-        let first = null;
-        for (const [hConnId, sid] of entries) {
-          const frame = encodeControl(MSG_PEER_CONN, encodePeerConn(hConnId, token, sid));
-          if (first === null) {
-            first = frame;
-            continue;
-          }
-          console.log(`adapter SYNC: pushing PEER_CONN helper=${hConnId} shortId=${sid}`);
-          const st = await wsSend(adapterConnId, frame, token);
-          if (st >= 400) {
-            console.log(`adapter SYNC: adapter ${adapterConnId} stale (status=${st}), aborting`);
+        const [firstConnId, firstShort] = entries[0];
+        const first = encodeControl(MSG_PEER_CONN, encodePeerConn(firstConnId, token, firstShort));
+        const rest = entries.slice(1);
+        if (rest.length) {
+          const statuses = await Promise.all(rest.map(([hConnId, sid]) => {
+            console.log(`adapter SYNC: pushing PEER_CONN helper=${hConnId} shortId=${sid}`);
+            return wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(hConnId, token, sid)), token);
+          }));
+          if (statuses.some(connIdGone)) {
+            console.log(`adapter SYNC: adapter ${adapterConnId} gone, clearing`);
             adapterConnId = null;
-            break;
           }
         }
-        const [firstConnId, firstShort] = entries[0];
-        console.log(`adapter SYNC -> PEER_CONN helper=${firstConnId} shortId=${firstShort} (plus ${entries.length - 1} pushed)`);
+        console.log(`adapter SYNC -> PEER_CONN helper=${firstConnId} shortId=${firstShort} (plus ${rest.length} pushed)`);
         return binaryResp(first);
       }
       console.warn(`adapter MESSAGE: unhandled type=${msgName(type)}`);
@@ -382,11 +500,11 @@ async function handle(event, context) {
       if (wasKnown) adapterConnId = null;
       console.log(`adapter DISCONNECT connId=${connId} wasKnown=${wasKnown}`);
       // Notify every helper that the adapter is gone (no shortId payload —
-      // it's the singleton adapter going away).
-      for (const [hConnId] of Array.from(helpers)) {
+      // it's the singleton adapter going away). Fan out in parallel.
+      await Promise.all(Array.from(helpers).map(([hConnId]) => {
         console.log(`adapter DISCONNECT: notifying helper ${hConnId} of PEER_GONE`);
-        await wsSend(hConnId, encodeControl(MSG_PEER_GONE), token);
-      }
+        return wsSend(hConnId, encodeControl(MSG_PEER_GONE), token);
+      }));
       return { statusCode: 200 };
     }
     console.warn(`adapter: unknown event type=${ev}`);
@@ -428,45 +546,41 @@ async function handle(event, context) {
       const seqId = buf.readUInt32BE(5);
       console.log(`helper MESSAGE type=${msgName(type)} streamId=${streamId} seq=${seqId} len=${buf.length}`);
 
-      // Stream frames (type >= 0x10): relay to adapter
-      if (type >= 0x10) {
-        if (!adapterConnId) await ensurePeerKnown('adapter', token);
-        if (adapterConnId) {
-          console.log(`relay ${msgName(type)} streamId=${streamId} seq=${seqId} -> adapter ${adapterConnId} bytes=${buf.length}`);
-          const st = await wsSend(adapterConnId, buf, token);
-          if (st >= 400) {
-            console.error(`relay FAILED status=${st}, clearing stale adapterConnId=${adapterConnId}`);
-            adapterConnId = null;
-            // Return error frame so helper doesn't wait forever
-            if (type === MSG_OPEN) {
-              return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('adapter unreachable')));
-            }
-            return binaryResp(encodeStreamFrame(MSG_RST, streamId));
-          }
-        } else {
-          console.warn(`relay DROP ${msgName(type)} streamId=${streamId}: no adapter connected`);
-          if (type === MSG_OPEN) {
-            return binaryResp(encodeStreamFrame(MSG_OPEN_FAIL, streamId, Buffer.from('no adapter connected')));
-          }
-          return binaryResp(encodeStreamFrame(MSG_RST, streamId));
-        }
+      // Stream frames (0x10..0x22): relay to adapter (with recovery retry).
+      // Use an explicit range — NOT `type >= 0x10` — because the control frames
+      // PING (0xF0) and PONG (0xF1) are numerically ABOVE 0x10 too. A naive
+      // lower-bound check relayed the helper's keepalive PING to the adapter
+      // (which then logged "unknown frame type=0xf0") and burned a wsSend per
+      // ping. Control frames (HELLO/PING/SYNC) must fall through to be handled.
+      if (type >= MSG_OPEN && type <= MSG_RST) {
+        const errResp = await relayToAdapter(buf, type, streamId, token);
+        if (errResp) return errResp;
         return { statusCode: 200 };
       }
 
       if (type === MSG_HELLO) {
         const ver = buf[9];
         const tok = buf.subarray(10).toString('utf-8');
-        if (ver !== 1 || tok !== AUTH_TOKEN) {
-          console.error(`helper HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
+        const tokenOk = safeEqual(tok, AUTH_TOKEN);
+        if (ver !== 1 || !tokenOk) {
+          console.error(`helper HELLO auth failed ver=${ver} tokenMatch=${tokenOk}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
         if (!adapterConnId) await ensurePeerKnown('adapter', token);
         if (adapterConnId) {
           console.log(`helper HELLO: notifying adapter ${adapterConnId} of helper connId shortId=${shortId}`);
-          const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
+          let st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
           if (st >= 400) {
-            console.log(`helper HELLO: adapter ${adapterConnId} is stale (status=${st}), clearing`);
-            adapterConnId = null;
+            // Cached adapter id may be stale. Re-fetch the authoritative id
+            // (never null it — that cascades to concurrent invocations) and
+            // re-push once so the adapter reliably learns this helper.
+            console.log(`helper HELLO: wsSend to adapter ${adapterConnId} failed (status=${st}), re-fetching`);
+            const before = adapterConnId;
+            await refreshConnIds(token, 1);
+            if (adapterConnId && adapterConnId !== before) {
+              st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
+              console.log(`helper HELLO: re-pushed to healed adapter ${adapterConnId} status=${st}`);
+            }
           }
         }
         console.log(`helper authenticated connId=${connId} shortId=${shortId} adapterConnId=${adapterConnId || 'null'} tokenLen=${token.length}`);
@@ -484,10 +598,16 @@ async function handle(event, context) {
         // Cross-notify adapter of this helper (covers cross-instance state loss).
         if (adapterConnId) {
           console.log(`helper PING: cross-notifying adapter ${adapterConnId} of helper shortId=${shortId}`);
-          const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
+          let st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
           if (st >= 400) {
-            console.log(`helper PING: adapter ${adapterConnId} is stale (status=${st}), clearing`);
-            adapterConnId = null;
+            // Cached adapter id may be stale. Re-fetch (never null) and re-push.
+            console.log(`helper PING: wsSend to adapter ${adapterConnId} failed (status=${st}), re-fetching`);
+            const before = adapterConnId;
+            await refreshConnIds(token, 1);
+            if (adapterConnId && adapterConnId !== before) {
+              st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(connId, token, shortId)), token);
+              console.log(`helper PING: re-pushed to healed adapter ${adapterConnId} status=${st}`);
+            }
           }
         }
         console.log(`helper PING -> PONG tokenLen=${token.length}`);

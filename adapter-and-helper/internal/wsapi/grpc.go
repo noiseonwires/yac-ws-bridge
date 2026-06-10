@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -16,37 +17,50 @@ import (
 
 const grpcEndpoint = "apigateway-connections.api.cloud.yandex.net:443"
 
+// callTimeout bounds each wsSend/Disconnect RPC. Without it a hung YC API call
+// would block the calling stream's read loop indefinitely (no progress, no
+// error, no teardown). The data path is normally sub-second; this is only a
+// safety net so a stuck call eventually fails and the stream can recover.
+const callTimeout = 20 * time.Second
+
 type grpcClient struct {
-	once   sync.Once
+	mu     sync.Mutex
 	client ws.ConnectionServiceClient
 	conn   *grpc.ClientConn
-	err    error
 }
 
-func (g *grpcClient) init() {
-	g.once.Do(func() {
-		creds := credentials.NewTLS(&tls.Config{})
-		g.conn, g.err = grpc.NewClient(grpcEndpoint, grpc.WithTransportCredentials(creds))
-		if g.err != nil {
-			g.err = fmt.Errorf("grpc dial: %w", g.err)
-			return
-		}
-		g.client = ws.NewConnectionServiceClient(g.conn)
-		log.Println("[INFO] gRPC WS API client initialized:", grpcEndpoint)
-	})
+// ensure lazily builds the gRPC client. Unlike a sync.Once, a transient
+// failure is NOT cached permanently: the next call retries, so the process can
+// recover instead of being wedged for its whole lifetime by one early error.
+func (g *grpcClient) ensure() (ws.ConnectionServiceClient, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.client != nil {
+		return g.client, nil
+	}
+	creds := credentials.NewTLS(&tls.Config{})
+	conn, err := grpc.NewClient(grpcEndpoint, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		return nil, fmt.Errorf("grpc dial: %w", err)
+	}
+	g.conn = conn
+	g.client = ws.NewConnectionServiceClient(conn)
+	log.Println("[INFO] gRPC WS API client initialized:", grpcEndpoint)
+	return g.client, nil
 }
 
-func (g *grpcClient) authCtx(iamToken string) context.Context {
+func (g *grpcClient) authCtx(iamToken string) (context.Context, context.CancelFunc) {
 	md := metadata.New(map[string]string{
 		"authorization": "Bearer " + iamToken,
 	})
-	return metadata.NewOutgoingContext(context.Background(), md)
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	return metadata.NewOutgoingContext(ctx, md), cancel
 }
 
 func (g *grpcClient) Send(connectionID string, data []byte, dataType string, iamToken string) error {
-	g.init()
-	if g.err != nil {
-		return g.err
+	client, err := g.ensure()
+	if err != nil {
+		return err
 	}
 
 	t := ws.SendToConnectionRequest_BINARY
@@ -54,7 +68,9 @@ func (g *grpcClient) Send(connectionID string, data []byte, dataType string, iam
 		t = ws.SendToConnectionRequest_TEXT
 	}
 
-	_, err := g.client.Send(g.authCtx(iamToken), &ws.SendToConnectionRequest{
+	ctx, cancel := g.authCtx(iamToken)
+	defer cancel()
+	_, err = client.Send(ctx, &ws.SendToConnectionRequest{
 		ConnectionId: connectionID,
 		Data:         data,
 		Type:         t,
@@ -66,12 +82,14 @@ func (g *grpcClient) Send(connectionID string, data []byte, dataType string, iam
 }
 
 func (g *grpcClient) Disconnect(connectionID string, iamToken string) error {
-	g.init()
-	if g.err != nil {
-		return g.err
+	client, err := g.ensure()
+	if err != nil {
+		return err
 	}
 
-	_, err := g.client.Disconnect(g.authCtx(iamToken), &ws.DisconnectRequest{
+	ctx, cancel := g.authCtx(iamToken)
+	defer cancel()
+	_, err = client.Disconnect(ctx, &ws.DisconnectRequest{
 		ConnectionId: connectionID,
 	})
 	if err != nil {
