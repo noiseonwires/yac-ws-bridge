@@ -100,6 +100,21 @@ async function wsSend(connId, data, type, token) {
   } catch(e) { console.error('wsSend err:', e, connId); return 500; }
 }
 
+// WS management API - force-close a specific connection.
+// Used to cleanly reset a client when a DATA frame could not be delivered to
+// the adapter: a lost TLS record desynchronises the stream, so the only safe
+// recovery is to tear the connection down so the client reconnects fresh.
+async function wsDisconnect(connId, token) {
+  try {
+    const r = await httpPost(
+      `https://apigateway-connections.api.cloud.yandex.net/apigateways/websocket/v1/connections/${encodeURIComponent(connId)}:disconnect`,
+      { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, '{}'
+    );
+    if (r.status >= 300) console.error('wsDisconnect fail:', r.status, connId);
+    return r.status;
+  } catch(e) { console.error('wsDisconnect err:', e, connId); return 500; }
+}
+
 // --- Protocol (string client IDs, no batching in v3) ---
 // Wire: [2B cidLen][clientId][type][flags][2B seqLen][seqId][payload]
 function encode(clientId, type, flags, seqId, payload) {
@@ -141,31 +156,46 @@ const MSG_DATA_C2T=0x20, MSG_PING=0xF0, MSG_PONG=0xF1;
 const FLAG_TEXT=0x01;
 
 // Send frame to adapter via upstream WS, POST fallback if unavailable.
-// IMPORTANT: never block on fetchUpstreamConnId() here — the latency gap
-// between fast (wsSend ~5ms) and slow (fetch+wsSend ~200ms) paths causes
-// message reordering across CF instances. When connId is unknown, go straight
-// to POST (~15ms) and fetch connId in the background for subsequent calls.
+// Returns true only when the frame was provably handed to the adapter:
+//   - WS path: management API returned 2xx.
+//   - POST path: the adapter's wakeup endpoint returned 200 (it ingests the
+//     frame synchronously before replying, so 200 == delivered).
+// A false return means the frame is lost; callers MUST treat that as fatal for
+// the affected stream (reset the client) rather than silently returning 200.
+//
+// IMPORTANT: never block on fetchUpstreamConnId() on the hot path — the latency
+// gap between the fast (wsSend ~5ms) and slow (fetch+wsSend ~200ms) paths causes
+// message reordering across CF instances. When connId is unknown, go straight to
+// POST (~30ms, reliable) and let the background fetch populate connId for later.
 async function sendToAdapter(frame, iamToken) {
   if (upstreamConnId) {
     const st = await wsSend(upstreamConnId, frame, 'BINARY', iamToken);
-    if (st < 400) return;
+    if (st >= 200 && st < 300) return true;
     console.error('upstream WS send failed, status:', st, 'connId:', upstreamConnId);
     upstreamConnId = null;
-    // Don't retry with fetch — fall through to POST to minimize latency gap
+    // Fall through to POST. NOTE: a 2xx wsSend can still be lost if the gateway
+    // has not yet reaped a dead upstream socket (no end-to-end ack exists). This
+    // window is unavoidable without a client-side sequence/ack layer.
   }
-  // POST fallback — also triggers adapter to connect upstream
-  if (!WAKEUP_URL) return;
-  console.log('sending frame via POST fallback, upstreamConnId:', upstreamConnId ? 'known' : 'unknown');
-  try {
-    const r = await httpPost(WAKEUP_URL, {
-      'Content-Type': 'application/octet-stream',
-      'Authorization': 'Bearer ' + AUTH_TOKEN,
-    }, Buffer.from(frame));
-    if (r.status === 200 && r.body) {
-      upstreamConnId = r.body;
-      console.log('recovered upstream connId from POST response:', upstreamConnId);
+  // POST fallback — synchronous adapter ingest, also triggers upstream connect.
+  // Retry once to avoid dropping a frame on a transient network blip.
+  if (!WAKEUP_URL) return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await httpPost(WAKEUP_URL, {
+        'Content-Type': 'application/octet-stream',
+        'Authorization': 'Bearer ' + AUTH_TOKEN,
+      }, Buffer.from(frame));
+      if (r.status === 200) {
+        if (r.body) upstreamConnId = r.body;
+        return true;
+      }
+      console.error('wakeup POST non-200, status:', r.status, 'attempt:', attempt);
+    } catch(e) {
+      console.error('wakeup POST err (attempt ' + attempt + '):', e.message || e);
     }
-  } catch(e) { console.error('wakeup POST err:', e.message || e); }
+  }
+  return false;
 }
 
 // --- HTTP forwarding ---
@@ -250,17 +280,24 @@ async function handle(event, context) {
   }
 
   // --- CLIENT ---
-  if (_fetchPromise) {
-    await _fetchPromise;
-    _fetchPromise = null;
-  }
+  // NOTE: do NOT block the hot path on _fetchPromise. Waiting ~200ms for the
+  // background connId fetch would delay this frame while frames on warm
+  // instances race ahead, causing reordering. When connId is unknown the POST
+  // fallback (reliable, ~30ms) keeps arrival skew within the adapter's reorder
+  // window. The background fetch still populates connId for subsequent frames.
 
   if (ev === 'CONNECT') {
     const path = event.path || '/';
     const sub = getHeader(event.headers, 'Sec-WebSocket-Protocol');
     console.log('client CONNECT:', connId, 'path:', path, 'subproto:', sub ? sub.substring(0,50)+'...' : '(none)');
     const payload = encodeClientConnected(path, sub, token);
-    await sendToAdapter(encode(connId, MSG_CLIENT_CONNECTED, 0, '', payload), token);
+    const ok = await sendToAdapter(encode(connId, MSG_CLIENT_CONNECTED, 0, '', payload), token);
+    if (!ok) {
+      // Could not tell the adapter the client connected — reject the handshake
+      // so the client retries instead of opening a connection that goes nowhere.
+      console.error('CLIENT_CONNECTED delivery failed, rejecting connect:', connId);
+      return { statusCode: 502 };
+    }
     const headers = {};
     if (sub) headers['Sec-WebSocket-Protocol'] = sub;
     return { statusCode: 200, headers };
@@ -272,7 +309,13 @@ async function handle(event, context) {
     const isText = ct.startsWith('application/json') || ct.startsWith('text/');
     const rawMsgId = rc.messageId || '';
     console.log('client MSG:', connId, 'len:', buf.length, 'messageId:', rawMsgId, 'isText:', isText);
-    await sendToAdapter(encode(connId, MSG_DATA_C2T, isText ? FLAG_TEXT : 0, rawMsgId, buf), token);
+    const ok = await sendToAdapter(encode(connId, MSG_DATA_C2T, isText ? FLAG_TEXT : 0, rawMsgId, buf), token);
+    if (!ok) {
+      // A DATA frame was lost. The TLS stream is now unrecoverable, so force a
+      // clean close: the client will reconnect and start a fresh handshake.
+      console.error('DATA_C2T delivery failed, disconnecting client:', connId, 'messageId:', rawMsgId);
+      await wsDisconnect(connId, token);
+    }
     return { statusCode: 200 };
   }
 

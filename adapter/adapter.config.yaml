@@ -14,5 +14,17 @@ wakeup:
 target:
   url: "ws://localhost:9090"
 
+reorder:
+  # Yandex message IDs are reverse-chronological alphabetically (newest = smallest ID);
+  # the adapter sorts DATA_C2T frames by ID before forwarding. Cloud Function processing
+  # can still deliver frames out of order, so they are buffered briefly and reordered.
+  # Increase these if DATA_C2T frames still arrive late; higher values add handshake latency.
+  c2tDelayMs: 100
+  c2tMaxDelayMs: 350
+  # Sort direction for message IDs. "descending" (default) matches Yandex's current
+  # reverse-chronological IDs (newest = smallest). Switch to "ascending" only if Yandex
+  # changes to forward-chronological IDs (newest = largest).
+  seqOrder: "descending"
+
 logging:
-  level: "info"
+  level: "debug"
