@@ -3,6 +3,10 @@ bridge/node_modules/
 bridge/dist/
 
 # Adapter (Go)
+adapter/bin
+helper/bin
+adapter-and-helper/bin
+adapter-and-helper/dist
 adapter-and-helper/adapter
 adapter-and-helper/adapter.exe
 adapter-and-helper/helper
@@ -22,3 +26,7 @@ Thumbs.db
 .vscode
 maui-client/bin
 maui-client/obj
+maui-client/publish
+maui-client-linux/bin
+maui-client-linux/obj
+maui-client-linux/publish

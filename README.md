@@ -14,40 +14,39 @@ See [README_RU.md](README_RU.md) for documentation in Russian.
 
 **If you’re interested in other mind-blowing tunnels over things that were not designed for tunneling, please also check out my other project: [True-IMAP-Tunnel](https://github.com/noiseonwires/true-imap-tunnel).**
 
-## What's new — 2026-05-15
+### What's new — 2026-05-15
 
 This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so the first DATA packets after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections are established noticeably faster and the tunnel is significantly more stable, especially on mobile.
 Also, multiple clients (helpers) can now connect to the same adapter/function simultaneously without interfering with each other. The previous "one adapter — one function — one client" limitation no longer applies.
 
-## What's new — 2026-05-16
+### What's new — 2026-05-16
 
 The adapter's HTTP endpoint path is now configurable via the new `http.path` setting in `adapter.config.yaml` (default `/conn-ids`), so you can rename it to something non-fingerprintable without editing source code. Correspondingly, the cloud function env var `ADAPTER_URL` has been renamed to `HTTP_URL` and its format has changed: it now expects the **full** URL of the adapter's endpoint (including the path), e.g. `https://your-server:8080/conn-ids`, instead of just the HTTP base. If you upgrade an existing deployment, update both the adapter config and the function's env variable. See [Customizing endpoint paths](#customizing-endpoint-paths) for details.
 
-## What's new — 2026-06-15
+### What's new — 2026-06-15
 
 A round of stability and performance hardening across all components. **Backward compatibility is preserved** — wire protocol, config format, and cloud-function env vars are unchanged, so mixed-version setups keep working (updating all three together is still recommended).
 
 Highlights: the Go helper no longer drops the first response bytes (pre-registers streams + reorders incoming frames); reorder buffers are capped so a lost frame resets the stream instead of hanging forever; `wsSend` calls have a timeout and the gRPC client recovers from transient startup errors; the upstream waits briefly before reconnecting; the adapter's public HTTP endpoint got timeouts and constant-time auth; the Cloud Function fans out to helpers in parallel; and the MAUI client's write-coalescing was rewritten to drop a quadratic copy and a blocking read.
 
+### What's new — 2026-06-22
+
+MAUI Client now easily builds for Linux and works on Linux. 
+
 ## Versions
 
-The tunnel comes in four variants:
+The tunnel comes in two main variants:
 
 1. Single-adapter variant (branch `one-adapter`): proxies WebSocket connections (VLESS with WS transport or XMPP-over-WebSockets, for example). Does not require modifying clients or installing extra software on the client device — just point your WebSocket URL at the serverless function. Works slowly and sometimes unstably. See README_RU.md in the `one-adapter` branch for details.
 
-2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster. **(Use this version if you don't know from where to start!)**
+2. Adapter + helper variant (branch `main`) — one component on the server side, one on the client side. Proxies arbitrary TCP connections and works much more stably and faster.
 
-3. Experimental variant (branch `experimental`), similar to variant 2 but instead of a custom multiplexing/error-correction algorithm it uses QUIC wrapped in WebSocket messages.
-
-4. Experimental IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter (**Android-only**). Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but acceptable for Telegram. See README/README_RU on the `ip-tun` branch for details.
-
-In the adapter + helper variant:
-
+This is the second variant.
 Two Go binaries — **adapter** (on the target server side) and **helper** (on the client side) — each maintain an upstream WebSocket connection to the YC API Gateway. In "no relay" mode, data is sent **directly** through the YC WebSocket management API (gRPC `wsSend`), bypassing the Serverless Function on the data path. The Serverless Function is only needed so the client and server (helper and adapter) can find each other.
 
-Under good conditions (adapter located in Russia near Yandex) you can squeeze out up to 20 Mbit/s.
+Under good conditions (adapter located not far from Yandex) you can squeeze out up to 20 Mbit/s.
 
-There is also a cross-platform **MAUI application** (Android, iOS, Windows, macOS, and Linux via GTK4) as a GUI alternative to the Go helper — see [maui-client/README.md](maui-client/README.md).
+There is also a cross-platform **MAUI application** (Android, iOS, Windows, macOS, and Linux) as a GUI alternative to the Go helper — see [maui-client/README.md](maui-client/README.md). The Linux head (`maui-client-linux/`) cross-compiles from any OS and CI publishes a self-contained `linux-x64` build alongside the Windows and Android artifacts.
 
 > **Note:** v4 tunnels raw TCP streams. Path prefixes (available in the single-adapter v3 for WebSocket proxying) are not supported.
 
@@ -95,7 +94,7 @@ In relay mode, frames belonging to the same stream may arrive out of order. The 
 
 ### Write coalescing
 
-The `writeCoalescing` option implements an algorithm similar to TCP Nagle: small TCP reads are buffered and merged into a single DATA frame. This significantly reduces the number of `wsSend` / relay messages, which improves throughput and reduces load on YC. Data is sent either after `delayMs` elapses, or when the buffer reaches 32 KB — whichever comes first. With the Go helper, it is recommended to always enable this on the adapter side when using relay mode; without relay it is optional on both sides (try it — it may be better with or without). In the MAUI app it is buggy.
+The `writeCoalescing` option implements an algorithm similar to TCP Nagle: small TCP reads are buffered and merged into a single DATA frame. This significantly reduces the number of `wsSend` / relay messages, which improves throughput and reduces load on YC. Data is sent either after `delayMs` elapses, or when the buffer reaches 32 KB — whichever comes first. With the Go helper, it is recommended to always enable this on the adapter side when using relay mode; without relay it is optional on both sides (try it — it may be better with or without). -In the MAUI app it is buggy.- (not anymore!)
 
 ### Relay mode
 

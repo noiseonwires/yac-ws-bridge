@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>BridgeToFreedom.Linux</RootNamespace>
+    <AssemblyName>BridgeToFreedom.Linux</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <!-- The shared MAUI project (..\maui-client) brings the MAUI resources;
+         this head should not auto-add anything. -->
+    <EnableDefaultMauiItems>false</EnableDefaultMauiItems>
+  </PropertyGroup>
+
+  <!--
+    The GTK4 backend for .NET MAUI lives in dotnet/maui-labs:
+      https://github.com/dotnet/maui-labs/tree/main/platforms/Linux.Gtk4
+
+    Runtime libs required on the target Linux box (NOT needed to build/publish):
+      Debian / Ubuntu : sudo apt install libgtk-4-1 libadwaita-1-0 \
+                                        libwebkitgtk-6.0-4 libgirepository-1.0-1 \
+                                        gsettings-desktop-schemas
+      Fedora          : sudo dnf install gtk4 libadwaita webkitgtk6.0 \
+                                        gobject-introspection
+      Arch            : sudo pacman -S gtk4 libadwaita webkitgtk-6.0 \
+                                        gobject-introspection
+  -->
+  <ItemGroup>
+    <!-- MAUI 10 no longer auto-adds Microsoft.Maui.Controls when UseMaui=true.
+         Floated to match the version pulled in transitively by the GTK4 backend. -->
+    <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.*" />
+    <!-- Official Microsoft GTK4 MAUI backend (dotnet/maui-labs). Still 0.1.0-preview.
+         The .Essentials package's AddLinuxGtk4Essentials() extension MUST be called
+         from MauiProgram so static Preferences.Default / Clipboard.Default get
+         backed by the Linux implementations instead of MAUI's throwing stubs. -->
+    <PackageReference Include="Microsoft.Maui.Platforms.Linux.Gtk4" Version="0.1.0-preview.*" />
+    <PackageReference Include="Microsoft.Maui.Platforms.Linux.Gtk4.Essentials" Version="0.1.0-preview.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reuse App.xaml, MainPage, TunnelService, etc. from the shared MAUI
+         project. SetTargetFramework forces it to build as the plain net10.0
+         shared-library TFM (see ..\maui-client\BridgeToFreedom.csproj). -->
+    <ProjectReference Include="..\maui-client\BridgeToFreedom.csproj"
+                      SetTargetFramework="TargetFramework=net10.0" />
+  </ItemGroup>
+
+</Project>

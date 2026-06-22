@@ -2,11 +2,6 @@
 
 Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **helper** — listens on a local TCP port and tunnels connections to the adapter through YC.
 
-## What's new — 2026-05-15
-
-This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so DATA packets that arrive immediately after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections come up noticeably faster and the tunnel is significantly more stable, especially on mobile.
-
-Also, multiple clients (helpers) can now connect to the same adapter/function simultaneously without interfering with each other. The previous "one adapter — one function — one client" limitation no longer applies.
 
 ## Supported platforms
 
@@ -14,16 +9,15 @@ Also, multiple clients (helpers) can now connect to the same adapter/function si
 - **iOS** (15.0+)
 - **Windows** (10 1809+)
 - **macOS** (via Mac Catalyst, macOS 12+)
-- **Linux** (via the GTK4 backend)
-
-> **Note on Linux:** A Linux build target is not set up in this repository, but MAUI now officially supports Linux through the GTK4 backend. Follow Microsoft's guide: <https://learn.microsoft.com/en-us/dotnet/maui/developer-tools/platform-backends/linux-gtk4?view=net-maui-10.0>. As an alternative, you can use the Go `helper` binary (`adapter-and-helper/cmd/helper`).
+- **Linux** (via the GTK4 backend — see [Linux build](#linux-build) below)
 
 ## Requirements
 
-- .NET 10 SDK
-- MAUI workload: `dotnet workload install maui`
+- .NET 10 SDK (only thing required for the Linux head)
+- MAUI workload (`dotnet workload install maui`) — needed for Android / iOS / macOS / Windows targets, **but NOT for the Linux head** (`maui` metapackage isn't even installable on Linux because it pulls in ios/maccatalyst). The Linux head builds straight from NuGet packages.
 - For Android: Android SDK (installed automatically with the MAUI workload)
 - For iOS/macOS: a Mac with Xcode
+- For Linux: GTK4 + libadwaita + WebKitGTK runtime libs on the target machine (see [Linux build](#linux-build))
 
 ## Important
 
@@ -39,6 +33,7 @@ dotnet build -f net10.0-android
 
 # Android (Release APK)
 dotnet publish -f net10.0-android -c Release
+# The Android APK will be in `bin/Release/net10.0-android/publish/`.
 
 # iOS (requires a Mac with Xcode)
 dotnet build -f net10.0-ios
@@ -48,9 +43,35 @@ dotnet build -f net10.0-windows10.0.19041.0
 
 # macOS (Mac only)
 dotnet build -f net10.0-maccatalyst
+
+# Linux
+cd ../maui-client-linux
+dotnet publish -c Release -r linux-x64 --self-contained -o publish/linux-x64
+# -> publish/linux-x64/BridgeToFreedom.Linux  (the executable)
 ```
 
-The Android APK will be in `bin/Release/net10.0-android/publish/`.
+## Linux build
+
+Linux support uses the GTK4 backend from [dotnet/maui-labs](https://github.com/dotnet/maui-labs/tree/main/platforms/Linux.Gtk4) (NuGet: [`Microsoft.Maui.Platforms.Linux.Gtk4`](https://www.nuget.org/packages/Microsoft.Maui.Platforms.Linux.Gtk4) + `.Essentials`). The Linux head project lives at [`maui-client-linux/`](../maui-client-linux/) and references the shared MAUI project as a `net10.0` library — the same App / MainPage / TunnelService code runs on every platform.
+
+
+### Build & run on Linux
+
+
+Install the GTK4 / libadwaita / WebKitGTK runtime libs (the GTK4 backend P/Invokes them on startup — without them the app throws `DllNotFoundException`):
+
+> **Required: GTK 4.12+** — the Microsoft GTK4 backend P/Invokes `gtk_css_provider_load_from_string`, added in GTK 4.12 (Sep 2023). On older GTK the app crashes at first render with `EntryPointNotFoundException`. Check with `pkg-config --modversion gtk4` or `dpkg -s libgtk-4-1 | grep Version`.
+>
+> **Distros that work out of the box (GTK 4.12+):** Ubuntu 24.04+, Debian 13 (trixie)+, Fedora 40+, RHEL 9+, Arch, openSUSE Tumbleweed.
+> **Distros that DO NOT work** (ship GTK < 4.12): Ubuntu 22.04 LTS (GTK 4.6), Debian 12 bookworm (GTK 4.8).
+
+| Distro | Command |
+| --- | --- |
+| **Debian 13+ / Ubuntu 24.04+ / Mint 22+ / WSL** | `sudo apt install -y libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 libgirepository-1.0-1 gsettings-desktop-schemas` |
+| **Fedora 40+ / RHEL 9+** | `sudo dnf install -y gtk4 libadwaita webkitgtk6.0 gobject-introspection glib2 cairo pango` |
+| **Arch / Manjaro** | `sudo pacman -S --needed gtk4 libadwaita webkitgtk-6.0 gobject-introspection glib2 cairo pango` |
+| **openSUSE Tumbleweed** | `sudo zypper install gtk4 libadwaita webkitgtk-6_0 gobject-introspection glib2 cairo pango` |
+
 
 ## Usage
 

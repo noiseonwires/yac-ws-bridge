@@ -2,28 +2,21 @@
 
 Кроссплатформенный GUI-клиент для TCP-туннеля Bridge to Freedom. Работает как **helper** — слушает локальный TCP-порт и туннелирует соединения к адаптеру через Yandex Cloud.
 
-## Что нового — 15.05.2026
-
-Эта версия серьёзно оптимизирована. Хелпер теперь переупорядочивает входящие фреймы по `SeqID`, пред-регистрирует stream до отправки `OPEN` (DATA-пакеты сразу после `OPEN_OK` больше не теряются), использует асинхронную очередь записи на каждый stream (медленный локальный клиент больше не блокирует все остальные streams), и корректно делает half-close по `FIN` (HTTP-ответы больше не обрываются). На практике: подключение устанавливается заметно быстрее, и туннель работает значительно стабильнее, особенно на мобильных устройствах.
-
-А еще теперь к одному адаптеру/сереру могут одновременно подключаться несколько клиентов (хелперов), не мешая друг другу. Прежнее ограничение «один адаптер — одна функция — один клиент» больше не действует.
-
 ## Поддерживаемые платформы
 
 - **Android** (API 26+ / Android 8.0+)
 - **iOS** (15.0+)
 - **Windows** (10 1809+)
 - **macOS** (через Mac Catalyst, macOS 12+)
-- **Linux** (через бэкенд GTK4)
-
-> **Про Linux:** Сборка под Linux в этом репозитории отдельно не настроена, но MAUI теперь официально поддерживает Linux через бэкенд GTK4. Следуйте инструкции Microsoft: <https://learn.microsoft.com/en-us/dotnet/maui/developer-tools/platform-backends/linux-gtk4?view=net-maui-10.0>. Как альтернатива, можно использовать Go-бинарник `helper` (`adapter-and-helper/cmd/helper`).
+- **Linux** (см. раздел [Сборка под Linux](#сборка-под-linux))
 
 ## Требования
 
 - .NET 10 SDK
-- MAUI workload: `dotnet workload install maui`
+- MAUI workload (`dotnet workload install maui`) — нужен для Android / iOS / macOS / Windows-сборок, **но НЕ нужен для Linux-head** (сам мета-workload `maui` на Linux вообще не ставится — он тянет ios/maccatalyst). Linux-head собирается напрямую из NuGet-пакетов.
 - Для Android: Android SDK (устанавливается автоматически с MAUI workload)
 - Для iOS/macOS: Mac с Xcode
+- Для Linux: на целевой машине нужны runtime-библиотеки GTK4 + libadwaita + WebKitGTK (см. [Сборка под Linux](#сборка-под-linux))
 
 ## Важно
 
@@ -39,6 +32,7 @@ dotnet build -f net10.0-android
 
 # Android (Release APK)
 dotnet publish -f net10.0-android -c Release
+# APK для Android будет в `bin/Release/net10.0-android/publish/`.
 
 # iOS (требуется Mac с Xcode)
 dotnet build -f net10.0-ios
@@ -48,9 +42,30 @@ dotnet build -f net10.0-windows10.0.19041.0
 
 # macOS (только на Mac)
 dotnet build -f net10.0-maccatalyst
+
+cd maui-client-linux
+dotnet publish -c Release -r linux-x64 --self-contained -o publish/linux-x64
+# -> publish/linux-x64/BridgeToFreedom.Linux  (исполняемый файл)
 ```
 
-APK для Android будет в `bin/Release/net10.0-android/publish/`.
+## Сборка под Linux
+
+Поддержка Linux работает через бэкенд GTK4 из [dotnet/maui-labs](https://github.com/dotnet/maui-labs/tree/main/platforms/Linux.Gtk4) (NuGet: [`Microsoft.Maui.Platforms.Linux.Gtk4`](https://www.nuget.org/packages/Microsoft.Maui.Platforms.Linux.Gtk4) + `.Essentials`). Linux-head проект лежит в [`maui-client-linux/`](../maui-client-linux/) и ссылается на основной MAUI-проект как на `net10.0`-библиотеку — один и тот же код App / MainPage / TunnelService работает на всех платформах.
+
+### Сборка и запуск на Linux
+
+Поставьте runtime-библиотеки GTK4 / libadwaita / WebKitGTK (бэкенд GTK4 P/Invoke'ит их при старте — без них приложение падает с `DllNotFoundException`):
+
+> **Нужна GTK 4.12+** 
+> **Дистрибутивы, где всё работает из коробки (GTK 4.12+):** Ubuntu 24.04+, Debian 13 (trixie)+, Fedora 40+, RHEL 9+, Arch, openSUSE Tumbleweed.
+> **Дистрибутивы, где НЕ работает** (в репах GTK < 4.12): Ubuntu 22.04 LTS (GTK 4.6), Debian 12 bookworm (GTK 4.8).
+
+| Дистрибутив | Команда |
+| --- | --- |
+| **Debian 13+ / Ubuntu 24.04+ / Mint 22+ / WSL** | `sudo apt install -y libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 libgirepository-1.0-1 gsettings-desktop-schemas` |
+| **Fedora 40+ / RHEL 9+** | `sudo dnf install -y gtk4 libadwaita webkitgtk6.0 gobject-introspection glib2 cairo pango` |
+| **Arch / Manjaro** | `sudo pacman -S --needed gtk4 libadwaita webkitgtk-6.0 gobject-introspection glib2 cairo pango` |
+| **openSUSE Tumbleweed** | `sudo zypper install gtk4 libadwaita webkitgtk-6_0 gobject-introspection glib2 cairo pango` |
 
 ## Использование
 

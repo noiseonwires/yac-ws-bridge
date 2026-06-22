@@ -176,7 +176,10 @@ public partial class MainPage : ContentPage
     {
         _tunnel.OnStopped -= OnTunnelStopped;
         StopPlatformService();
-        MainThread.BeginInvokeOnMainThread(() =>
+        // Use the page's own Dispatcher (works on every platform incl. Linux/GTK4)
+        // instead of the static MainThread facade, which has no implementation on
+        // Linux and throws NotImplementedInReferenceAssemblyException.
+        Dispatcher.Dispatch(() =>
         {
             _isRunning = false;
             ConnectButton.Text = "CONNECT";
@@ -187,7 +190,7 @@ public partial class MainPage : ContentPage
 
     private void OnTunnelLog(string line)
     {
-        MainThread.BeginInvokeOnMainThread(() => AddLog(line));
+        Dispatcher.Dispatch(() => AddLog(line));
     }
 
     /// <summary>
@@ -198,9 +201,9 @@ public partial class MainPage : ContentPage
     {
         // Diagnostic: confirm we actually receive the event (we have seen
         // cases where the probe runs but the UI doesn't update).
-        MainThread.BeginInvokeOnMainThread(() => AddLog($"[ui] probe status -> {status}: {detail}"));
+        Dispatcher.Dispatch(() => AddLog($"[ui] probe status -> {status}: {detail}"));
 
-        MainThread.BeginInvokeOnMainThread(() =>
+        Dispatcher.Dispatch(() =>
         {
             switch (status)
             {

@@ -161,6 +161,51 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # MAUI: Linux (self-contained linux-x64 via the GTK4 backend)
+  #
+  # Build only — no native GTK4 libs are needed in CI. They ARE required to
+  # RUN the app on a Linux desktop (see maui-client/README.md "Linux build").
+  #
+  # WORKLOAD NOTE: We DO NOT install the full `maui` metapackage (it pulls in
+  # ios/maccatalyst which require macOS and fail on Linux with NETSDK1147).
+  # However, the SDK's ImportWorkloads check sees `Microsoft.Maui.Controls`
+  # + `<UseMaui>true</UseMaui>` and insists on at least ONE maui sub-workload.
+  # On Linux the only Linux-installable one is `maui-tizen` — installing it
+  # is a tiny no-op (we never target net10.0-tizen) that satisfies the check.
+  # ---------------------------------------------------------------------------
+  build-maui-linux:
+    name: MAUI Linux (linux-x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install maui-tizen workload (placeholder to satisfy SDK check)
+        run: dotnet workload install maui-tizen --ignore-failed-sources
+
+      - name: Publish (self-contained linux-x64)
+        working-directory: maui-client-linux
+        run: |
+          dotnet publish BridgeToFreedom.Linux.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained \
+            -o publish/linux-x64
+
+      # upload-artifact wraps every upload in a ZIP, so we upload the raw
+      # publish folder rather than a pre-made tarball (avoids double-packing).
+      # The release job re-tars these files into BridgeToFreedom-linux-x64.tar.gz.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: maui-linux-x64
+          path: maui-client-linux/publish/linux-x64/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Cloud function: plain zip (obfuscate yourself before uploading to YC)
   # ---------------------------------------------------------------------------
   build-cloud:
@@ -192,7 +237,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-go, build-maui-windows, build-maui-android, build-cloud]
+    needs: [build-go, build-maui-windows, build-maui-android, build-maui-linux, build-cloud]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -201,6 +246,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Repackage Linux publish folder into release tarball
+        run: |
+          if [ -d artifacts/maui-linux-x64 ]; then
+            mkdir -p release
+            tar -czf release/BridgeToFreedom-linux-x64.tar.gz -C artifacts/maui-linux-x64 .
+          fi
 
       - name: Flatten artifacts
         run: |

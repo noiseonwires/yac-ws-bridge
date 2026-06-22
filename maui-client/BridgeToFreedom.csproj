@@ -1,15 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <!--
-      iOS / Mac Catalyst can only be built on macOS, so we only include them
-      when the host is macOS. This keeps `dotnet workload restore` on Windows
-      / Linux CI from pulling in the (large) ios + maccatalyst workloads.
-      To build for iOS / Mac Catalyst locally, run on macOS — the TFMs will
-      light up automatically.
-    -->
-    <TargetFrameworks>net10.0-android;net10.0-windows10.0.19041.0</TargetFrameworks>
+    <!-- TFMs gated by host OS so restore doesn't pull workloads it can't install.
+         net10.0 is always present: shared lib consumed by ../maui-client-linux. -->
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('Linux'))">$(TargetFrameworks);net10.0-android;net10.0-windows10.0.19041.0</TargetFrameworks>
     <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
     <OutputType>Exe</OutputType>
+    <!-- net10.0 is a shared lib for the Linux head; no platform Main. -->
+    <OutputType Condition="'$(TargetFramework)' == 'net10.0'">Library</OutputType>
+    <!-- Linux head propagates RID into ProjectReferences; declare what we support. -->
+    <RuntimeIdentifiers Condition="'$(TargetFramework)' == 'net10.0'">linux-x64;linux-arm64</RuntimeIdentifiers>
     <RootNamespace>BridgeToFreedom</RootNamespace>
     <UseMaui>true</UseMaui>
     <SingleProject>true</SingleProject>
@@ -30,9 +30,7 @@
     <WindowsPackageType Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">None</WindowsPackageType>
   </PropertyGroup>
 
-  <!-- Windows: ship an app.manifest so the unpackaged app declares
-       PerMonitorV2 DPI awareness. Without this, text is blurry on
-       high-DPI / non-100% scaling displays. -->
+  <!-- PerMonitorV2 DPI awareness; without this text is blurry at non-100% scaling. -->
   <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
     <ApplicationManifest>Platforms\Windows\app.manifest</ApplicationManifest>
   </PropertyGroup>
@@ -49,8 +47,7 @@
 
   <PropertyGroup Condition="'$(TargetFramework)'=='net10.0-ios'">
     <MtouchLink>SdkOnly</MtouchLink>
-    <!-- Сomment out to disable silent audio background mode (keeps tunnel alive indefinitely).
-         May cause App Store rejection. -->
+    <!-- Remove to disable silent-audio background mode (may cause App Store rejection). -->
     <DefineConstants>$(DefineConstants);IOS_BACKGROUND_AUDIO</DefineConstants>
   </PropertyGroup>
 

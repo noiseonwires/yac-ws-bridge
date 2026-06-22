@@ -1,0 +1,2 @@
+# Native .so files are produced by the build script; never commit them.
+*.so
